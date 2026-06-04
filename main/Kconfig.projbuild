@@ -1,0 +1,40 @@
+menu "IPC Configuration"
+    config STUN_URL
+        string "STUN URL"
+        default "stun.l.google.com:19302"
+        help
+            Enter the URL of STUN server.
+    menuconfig TURN
+        bool "Enable TURN"
+        default n
+        help
+            Enable this if the device is behind a restrictive NAT and cannot connect to peers with STUN alone.
+    if TURN
+        config TURN_URL
+            string "TURN URL"
+            default "turn:openrelay.metered.ca:80"
+            help
+                Enter the URL of TURN server.
+        config TURN_USERNAME
+            string "TURN Username"
+            default "openrelayproject"
+            help
+                Enter the username for TURN server authentication.
+        config TURN_CREDENTIAL
+            string "TURN Credential"
+            default "openrelayproject"
+            help
+                Enter the crdential for TURN server authentication.
+    endif
+
+    config SIGNALING_URL
+        string "Signaling URL"
+        default "https://libpeer.com/public/test"
+        help
+            Enter the URL of the Peer library to use.
+    config SIGNALING_TOKEN
+        string "Signaling Token"
+        default ""
+        help
+            Enter the token of the Peer library to use.
+endmenu

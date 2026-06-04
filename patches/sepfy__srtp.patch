@@ -1,0 +1,8 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -114,3 +114,5 @@
+ target_compile_definitions(${COMPONENT_LIB} PUBLIC "-DHAVE_CONFIG_H")
+ #  OUCH!  Fix a false positive in crypto_kernel.c to prevent an error during a debug build.
+ set_source_files_properties(libsrtp/crypto/kernel/crypto_kernel.c PROPERTIES COMPILE_FLAGS -Wno-maybe-uninitialized)
++# uint32_t vs unsigned int pointer type mismatch on RISC-V (ESP32-P4) where uint32_t = unsigned long.
++target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=incompatible-pointer-types -Wno-incompatible-pointer-types)
