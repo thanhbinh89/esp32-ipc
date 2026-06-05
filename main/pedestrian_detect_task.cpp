@@ -29,6 +29,7 @@ static void store_results(const std::list<dl::detect::result_t> &results)
         if (res.box.size() < 4) {
             continue;
         }
+
         s_boxes[n].x1 = res.box[0];
         s_boxes[n].y1 = res.box[1];
         s_boxes[n].x2 = res.box[2];
@@ -41,7 +42,7 @@ static void store_results(const std::list<dl::detect::result_t> &results)
 
     ESP_LOGI(TAG, "pedestrians: %d", n);
     for (int i = 0; i < n; i++) {
-        ESP_LOGI(TAG, "  [%d] (%d,%d)-(%d,%d) score=%.2f", i,
+        ESP_LOGI(TAG, "[%d] (%d,%d)-(%d,%d) score=%.2f", i,
                  s_boxes[i].x1, s_boxes[i].y1, s_boxes[i].x2, s_boxes[i].y2, s_boxes[i].score);
     }
 }
@@ -69,9 +70,7 @@ static void detect_task(void *arg)
 
         int64_t t1 = esp_timer_get_time();
 
-        ESP_LOGI("BENCH", "Inference time: %lld us, %.2f ms",
-                t1 - t0,
-                (t1 - t0) / 1000.0);
+        ESP_LOGD(TAG, "Inference time: %.2f ms", (t1 - t0) / 1000.0);
 
         camera_pipeline_queue_element_index(s_feed_pipeline, cpre->index);
         vTaskDelay(pdMS_TO_TICKS(10));

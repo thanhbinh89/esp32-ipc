@@ -117,7 +117,7 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "feed pipeline alloc failed; running H.264 only");
     }
     // pedestrian detect init
-    // ESP_ERROR_CHECK(pedestrian_detect_task_start(&s_feed_pipeline));
+    ESP_ERROR_CHECK(pedestrian_detect_task_start(&s_feed_pipeline));
     // video task
     xTaskCreatePinnedToCore(video_task, "camera", 4096, s_feed_pipeline, 5, NULL, 0);
     // webrtc task

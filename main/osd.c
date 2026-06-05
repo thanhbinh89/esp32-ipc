@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include "osd.h"
 
 static inline void put_pixel_yuv420(uint8_t *buf, int width, int height,
@@ -7,17 +8,15 @@ static inline void put_pixel_yuv420(uint8_t *buf, int width, int height,
         return;
     }
 
-    uint8_t *y_plane = buf;
-    uint8_t *u_plane = buf + width * height;
-    uint8_t *v_plane = u_plane + (width / 2) * (height / 2);
+    /* ESP32-P4 "YUV420" is the packed O_UYY_E_VYY layout the H.264 encoder
+     * requires: each line is 1.5*width bytes, grouped as [C Y Y][C Y Y]...,
+     * where the leading chroma byte C is U on even lines and V on odd lines. */
+    int stride = width + (width >> 1);
+    uint8_t *line = buf + (size_t)y * stride;
+    int group = x >> 1;
 
-    y_plane[y * width + x] = yc;
-
-    int cx = x >> 1;
-    int cy = y >> 1;
-    int c_idx = cy * (width / 2) + cx;
-    u_plane[c_idx] = uc;
-    v_plane[c_idx] = vc;
+    line[group * 3 + 1 + (x & 1)] = yc;         /* luma */
+    line[group * 3] = (y & 1) ? vc : uc;        /* U on even rows, V on odd rows */
 }
 
 void osd_draw_rect_yuv420(uint8_t *buf, int width, int height,

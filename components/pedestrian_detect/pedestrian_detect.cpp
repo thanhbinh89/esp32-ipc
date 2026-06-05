@@ -17,12 +17,11 @@ Pico::Pico(const char *model_name)
     m_model =
         new dl::Model(model_name, static_cast<fbs::model_location_type_t>(CONFIG_PEDESTRIAN_DETECT_MODEL_LOCATION));
 #endif
-#if CONFIG_IDF_TARGET_ESP32P4
-    m_image_preprocessor =
-        new dl::image::ImagePreprocessor(m_model, {0, 0, 0}, {1, 1, 1}, DL_IMAGE_CAP_RGB565_BIG_ENDIAN);
-#else
+    /* Our RGB565 reaches the detector via PPA (YUV420 -> RGB565), which emits
+     * standard little-endian RGB565. The esp-dl default DL_IMAGE_CAP_RGB565_BIG_ENDIAN
+     * (for camera-direct big-endian RGB565) would byte-swap and scramble colours,
+     * so feed little-endian here on every target. */
     m_image_preprocessor = new dl::image::ImagePreprocessor(m_model, {0, 0, 0}, {1, 1, 1});
-#endif
     m_postprocessor =
         new dl::detect::PicoPostprocessor(m_model, 0.5, 0.5, 10, {{8, 8, 4, 4}, {16, 16, 8, 8}, {32, 32, 16, 16}});
 }

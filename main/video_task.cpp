@@ -28,16 +28,16 @@ static const char *TAG = "video";
 #define CAP_BUF_COUNT   3
 #define VIDEO_QUEUE_LEN 2
 
-#define H264_I_PERIOD   30
-#define H264_BITRATE    2000000
-#define H264_MIN_QP     30
-#define H264_MAX_QP     40
+#define H264_I_PERIOD   5
+#define H264_BITRATE    1000000
+#define H264_MIN_QP     35
+#define H264_MAX_QP     45
 
 /* OSD box colour in YUV (red). */
 #define OSD_Y           76
 #define OSD_U           84
 #define OSD_V           255
-#define OSD_THICKNESS   16
+#define OSD_THICKNESS   4
 
 /* Detection coords are in PED_DETECT_* space; scale up to full frame for OSD. */
 #define OSD_SCALE_X     (CAM_WIDTH / PED_DETECT_WIDTH)
@@ -60,21 +60,9 @@ typedef struct {
     uint32_t stat_cap;
     uint32_t stat_cap_drop;
     uint32_t stat_enc;
-    uint32_t stat_enc_drop;
     uint32_t stat_send_ok;
     uint32_t stat_send_fail;
-    uint32_t stat_key_req;
-    uint32_t stat_idr_ok;
-    uint32_t stat_idr_fail;
     uint32_t stat_bytes;
-    uint64_t stat_cap_dq_us;
-    uint64_t stat_enc_q_us;
-    uint64_t stat_enc_dq_us;
-    uint64_t stat_send_us;
-    uint32_t stat_cap_dq_max_us;
-    uint32_t stat_enc_q_max_us;
-    uint32_t stat_enc_dq_max_us;
-    uint32_t stat_send_max_us;
 } video_ctx_t;
 
 static esp_err_t h264_set_ctrl(int fd, uint32_t id, int32_t value, const char *what)
@@ -107,10 +95,9 @@ static esp_err_t h264_force_idr(int fd)
 #endif
 }
 
-/* PPA-convert one full YUV420 frame to a downscaled RGB565 buffer (big-endian to
- * match the detector's preprocessor). Blocking. */
+/* PPA-convert one full YUV420 frame to a downscaled RGB565 buffer. Blocking. */
 static void feed_detector(ppa_client_handle_t ppa, pipeline_handle_t feed,
-                          const uint8_t *yuv420)
+                          uint8_t *yuv420)
 {
     if (!feed) {
         return;
@@ -144,7 +131,7 @@ static void feed_detector(ppa_client_handle_t ppa, pipeline_handle_t feed,
     cfg.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
     cfg.scale_x = (float)PED_DETECT_WIDTH / CAM_WIDTH;
     cfg.scale_y = (float)PED_DETECT_HEIGHT / CAM_HEIGHT;
-    cfg.byte_swap = false; /* produce big-endian RGB565 for the model preprocessor */
+    cfg.byte_swap = false;
     cfg.mode = PPA_TRANS_MODE_BLOCKING;
 
     if (ppa_do_scale_rotate_mirror(ppa, &cfg) != ESP_OK) {
@@ -180,15 +167,8 @@ static void video_capture_task(void *arg)
         item.buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         item.buf.memory = V4L2_MEMORY_MMAP;
 
-        int64_t t0_us = esp_timer_get_time();
         ESP_ERROR_CHECK(ioctl(ctx->cap_fd, VIDIOC_DQBUF, &item.buf));
-        uint32_t dt_us = (uint32_t)(esp_timer_get_time() - t0_us);
-        ctx->stat_cap_dq_us += dt_us;
-        if (dt_us > ctx->stat_cap_dq_max_us) {
-            ctx->stat_cap_dq_max_us = dt_us;
-        }
         ctx->stat_cap++;
-
         if (xQueueSend(ctx->cap_queue, &item, 0) != pdTRUE) {
             ctx->stat_cap_drop++;
             ESP_ERROR_CHECK(ioctl(ctx->cap_fd, VIDIOC_QBUF, &item.buf));
@@ -210,16 +190,13 @@ static void video_encode_task(void *arg)
         bool keyframe_requested = webrtc_take_keyframe_request();
 
         if (keyframe_requested) {
-            ctx->stat_key_req++;
             if (h264_force_idr(ctx->m2m_fd) == ESP_OK) {
-                ctx->stat_idr_ok++;
                 ESP_LOGI(TAG, "keyframe requested: force IDR ok");
             } else {
-                ctx->stat_idr_fail++;
                 ESP_LOGW(TAG, "keyframe requested: force IDR failed");
             }
         }
-#if 0
+
         /* Share the post-ISP YUV420 frame with the detector (PPA -> RGB565). Done
          * before OSD so the detector sees the unannotated frame. */
         feed_detector(ctx->ppa_handle, ctx->feed_pipeline, frame);
@@ -229,39 +206,23 @@ static void video_encode_task(void *arg)
         overlay_boxes(frame);
         esp_cache_msync(frame, ctx->cap_buffer_len[cap_item.buf.index],
                         ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-#endif
+
         struct v4l2_buffer m2m_out_buf = {};
         m2m_out_buf.index = 0;
         m2m_out_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
         m2m_out_buf.memory = V4L2_MEMORY_USERPTR;
         m2m_out_buf.m.userptr = (unsigned long)frame;
         m2m_out_buf.length = cap_item.buf.bytesused;
-
-        int64_t t0_us = esp_timer_get_time();
         ESP_ERROR_CHECK(ioctl(ctx->m2m_fd, VIDIOC_QBUF, &m2m_out_buf));
-        uint32_t dt_us = (uint32_t)(esp_timer_get_time() - t0_us);
-        ctx->stat_enc_q_us += dt_us;
-        if (dt_us > ctx->stat_enc_q_max_us) {
-            ctx->stat_enc_q_max_us = dt_us;
-        }
 
         struct v4l2_buffer m2m_cap_buf = {};
         m2m_cap_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         m2m_cap_buf.memory = V4L2_MEMORY_MMAP;
-
-        t0_us = esp_timer_get_time();
         ESP_ERROR_CHECK(ioctl(ctx->m2m_fd, VIDIOC_DQBUF, &m2m_cap_buf));
-        dt_us = (uint32_t)(esp_timer_get_time() - t0_us);
-        ctx->stat_enc_dq_us += dt_us;
-        if (dt_us > ctx->stat_enc_dq_max_us) {
-            ctx->stat_enc_dq_max_us = dt_us;
-        }
-
         ctx->stat_enc++;
         ctx->stat_bytes += m2m_cap_buf.bytesused;
 
         if (g_pc && eState == PEER_CONNECTION_COMPLETED && m2m_cap_buf.bytesused > 0) {
-            t0_us = esp_timer_get_time();
             if (xSemaphoreTake(g_pc_lock, pdMS_TO_TICKS(2)) == pdTRUE) {
                 ESP_LOGD(TAG, "send video frame: %u bytes", (unsigned)m2m_cap_buf.bytesused);
                 if (peer_connection_send_video(g_pc, ctx->m2m_cap_buffer, m2m_cap_buf.bytesused) < 0) {
@@ -272,11 +233,6 @@ static void video_encode_task(void *arg)
                 xSemaphoreGive(g_pc_lock);
             } else {
                 ctx->stat_send_fail++;
-            }
-            dt_us = (uint32_t)(esp_timer_get_time() - t0_us);
-            ctx->stat_send_us += dt_us;
-            if (dt_us > ctx->stat_send_max_us) {
-                ctx->stat_send_max_us = dt_us;
             }
         }
 
@@ -411,40 +367,19 @@ void video_task(void *arg)
 
         int64_t now_us = esp_timer_get_time();
         uint32_t elapsed_ms = (uint32_t)((now_us - stat_last_us) / 1000);
-        uint32_t stat_send_total = ctx.stat_send_ok + ctx.stat_send_fail;
         ESP_LOGI(TAG,
-                 "stats %ums: cap=%u cap_drop=%u enc=%u enc_drop=%u send_ok=%u send_fail=%u bitrate=%ukbps key_req=%u idr_ok=%u idr_fail=%u q_cap=%u "
-                 "avg_ms cap_dq=%u enc_q=%u enc_dq=%u send=%u max_ms cap_dq=%u enc_q=%u enc_dq=%u send=%u",
-                 elapsed_ms, ctx.stat_cap, ctx.stat_cap_drop, ctx.stat_enc, ctx.stat_enc_drop,
+                 "%ums: cap=%u cap_drop=%u enc=%u send_ok=%u send_fail=%u bitrate=%ukbps q_cap=%u",
+                 elapsed_ms, ctx.stat_cap, ctx.stat_cap_drop, ctx.stat_enc,
                  ctx.stat_send_ok, ctx.stat_send_fail,
-                 (unsigned)((ctx.stat_bytes * 8ULL) / elapsed_ms), ctx.stat_key_req,
-                 ctx.stat_idr_ok, ctx.stat_idr_fail,
-                 (unsigned)uxQueueMessagesWaiting(ctx.cap_queue),
-                 ctx.stat_cap ? (unsigned)(ctx.stat_cap_dq_us / ctx.stat_cap / 1000) : 0,
-                 ctx.stat_enc ? (unsigned)(ctx.stat_enc_q_us / ctx.stat_enc / 1000) : 0,
-                 ctx.stat_enc ? (unsigned)(ctx.stat_enc_dq_us / ctx.stat_enc / 1000) : 0,
-                 stat_send_total ? (unsigned)(ctx.stat_send_us / stat_send_total / 1000) : 0,
-                 ctx.stat_cap_dq_max_us / 1000, ctx.stat_enc_q_max_us / 1000,
-                 ctx.stat_enc_dq_max_us / 1000, ctx.stat_send_max_us / 1000);
+                 (unsigned)((ctx.stat_bytes * 8ULL) / elapsed_ms),
+                 (unsigned)uxQueueMessagesWaiting(ctx.cap_queue));
 
         ctx.stat_cap = 0;
         ctx.stat_cap_drop = 0;
         ctx.stat_enc = 0;
-        ctx.stat_enc_drop = 0;
         ctx.stat_send_ok = 0;
         ctx.stat_send_fail = 0;
-        ctx.stat_key_req = 0;
-        ctx.stat_idr_ok = 0;
-        ctx.stat_idr_fail = 0;
         ctx.stat_bytes = 0;
-        ctx.stat_cap_dq_us = 0;
-        ctx.stat_enc_q_us = 0;
-        ctx.stat_enc_dq_us = 0;
-        ctx.stat_send_us = 0;
-        ctx.stat_cap_dq_max_us = 0;
-        ctx.stat_enc_q_max_us = 0;
-        ctx.stat_enc_dq_max_us = 0;
-        ctx.stat_send_max_us = 0;
         stat_last_us = now_us;
     }
 }
