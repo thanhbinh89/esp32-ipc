@@ -30,13 +30,13 @@ OV5647 (MIPI-CSI) --> ISP (YUV420) --+--> PPA scale --> ESP-DL pedestrian detect
 
 ## Tasks
 
-| Task         | Role                                   |
-|--------------|----------------------------------------|
-| `video`      | capture, OSD, H.264 encode, send video |
-| `audio`      | G.711-A capture, send audio            |
-| `ped_detect` | ESP-DL inference                       |
-| `webrtc`     | `peer_signaling_loop` (MQTT)           |
-| `peer`       | `peer_connection_loop` (ICE/DTLS/RTP)  |
+| Task           | Role                                    |
+| -------------- | --------------------------------------- |
+| `video`      | capture, OSD, H.264 encode, send video  |
+| `audio`      | G.711-A capture, send audio             |
+| `ped_detect` | ESP-DL inference                        |
+| `webrtc`     | `peer_signaling_loop` (MQTT)          |
+| `peer`       | `peer_connection_loop` (ICE/DTLS/RTP) |
 
 ## Prerequisites
 

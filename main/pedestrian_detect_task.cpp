@@ -1,3 +1,9 @@
+#include "sdkconfig.h"
+#include "esp_err.h"
+#include "pedestrian_detect_task.h"
+
+#if CONFIG_APP_ENABLE_AI
+
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -5,7 +11,6 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 
-#include "pedestrian_detect_task.h"
 #include "pedestrian_detect.hpp"
 #include "dl_image_define.hpp"
 #include "app_camera_pipeline.hpp"
@@ -105,3 +110,20 @@ int pedestrian_detect_get_boxes(ped_box_t *out, int max)
     xSemaphoreGive(s_box_mutex);
     return n;
 }
+
+#else  /* !CONFIG_APP_ENABLE_AI: stubs, detector model never instantiated */
+
+esp_err_t pedestrian_detect_task_start(void *arg)
+{
+    (void)arg;
+    return ESP_OK;
+}
+
+int pedestrian_detect_get_boxes(ped_box_t *out, int max)
+{
+    (void)out;
+    (void)max;
+    return 0;
+}
+
+#endif /* CONFIG_APP_ENABLE_AI */

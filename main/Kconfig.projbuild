@@ -1,40 +1,82 @@
 menu "IPC Configuration"
-    config STUN_URL
-        string "STUN URL"
-        default "stun.l.google.com:19302"
+
+    choice APP_NETIF
+        prompt "Network interface"
+        default APP_NETIF_ETH
         help
-            Enter the URL of STUN server.
-    menuconfig TURN
-        bool "Enable TURN"
-        default n
+            Connectivity for the WebRTC stream: wired Ethernet, or Wi-Fi via the
+            esp_wifi_remote / esp_hosted co-processor (e.g. ESP32-C6 over SDIO).
+
+        config APP_NETIF_ETH
+            bool "Ethernet"
+
+        config APP_NETIF_WIFI
+            bool "Wi-Fi (esp_wifi_remote)"
+    endchoice
+
+        if APP_NETIF_WIFI
+            config ESP_WIFI_SSID
+                string "WiFi SSID"
+                default "myssid"
+                help
+                    SSID (network name) for the app to connect to.
+
+            config ESP_WIFI_PASSWORD
+                string "WiFi Password"
+                default "mypassword"
+                help
+                    WiFi password (WPA or WPA2) for the app to use.
+        endif
+
+    config APP_ENABLE_AI
+        bool "Enable pedestrian detection (AI)"
+        default y
         help
-            Enable this if the device is behind a restrictive NAT and cannot connect to peers with STUN alone.
-    if TURN
-        config TURN_URL
-            string "TURN URL"
-            default "turn:openrelay.metered.ca:80"
-            help
-                Enter the URL of TURN server.
-        config TURN_USERNAME
-            string "TURN Username"
-            default "openrelayproject"
-            help
-                Enter the username for TURN server authentication.
-        config TURN_CREDENTIAL
-            string "TURN Credential"
-            default "openrelayproject"
-            help
-                Enter the crdential for TURN server authentication.
-    endif
+            Run the esp-dl pedestrian detector and overlay boxes on the stream.
+            Disable to free internal RAM (the esp-dl model is never instantiated),
+            e.g. when Wi-Fi/esp_hosted is enabled and internal DMA RAM is tight.
 
     config SIGNALING_URL
         string "Signaling URL"
         default "https://libpeer.com/public/test"
         help
             Enter the URL of the Peer library to use.
+
     config SIGNALING_TOKEN
         string "Signaling Token"
         default ""
         help
             Enter the token of the Peer library to use.
+
+    config STUN_URL
+        string "STUN URL"
+        default "stun.l.google.com:19302"
+        help
+            Enter the URL of STUN server.
+
+    menuconfig TURN
+        bool "Enable TURN"
+        default n
+        help
+            Enable this if the device is behind a restrictive NAT and cannot connect to peers with STUN alone.
+
+        if TURN
+            config TURN_URL
+                string "TURN URL"
+                default "turn:openrelay.metered.ca:80"
+                help
+                    Enter the URL of TURN server.
+
+            config TURN_USERNAME
+                string "TURN Username"
+                default "openrelayproject"
+                help
+                    Enter the username for TURN server authentication.
+
+            config TURN_CREDENTIAL
+                string "TURN Credential"
+                default "openrelayproject"
+                help
+                    Enter the crdential for TURN server authentication.
+        endif
 endmenu
