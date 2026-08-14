@@ -14,13 +14,25 @@
 #include "pedestrian_detect.hpp"
 #include "dl_image_define.hpp"
 #include "app_camera_pipeline.hpp"
+#include "osd.h"
+#include "video_task.h"
+
+/* OSD box colour in YUV (red). */
+#define OSD_Y           76
+#define OSD_U           84
+#define OSD_V           255
+#define OSD_THICKNESS   4
+
+/* Detection coords are in PED_DETECT_* space; scale up to full frame for OSD. */
+#define OSD_SCALE_X     (CAM_WIDTH / PED_DETECT_WIDTH)
+#define OSD_SCALE_Y     (CAM_HEIGHT / PED_DETECT_HEIGHT)
 
 static const char *TAG = "ped_detect";
 
 static SemaphoreHandle_t s_box_mutex = NULL;
 static ped_box_t s_boxes[PED_DETECT_MAX_BOX];
 static int s_box_count = 0;
-static PedestrianDetect detect;
+static PedestrianDetect s_detect;
 static pipeline_handle_t s_feed_pipeline = NULL;
 
 static void store_results(const std::list<dl::detect::result_t> &results) {
@@ -69,31 +81,31 @@ static void detect_task(void *arg) {
 
         int64_t t0 = esp_timer_get_time();
 
-        store_results(detect.run(img));
+        store_results(s_detect.run(img));
 
         int64_t t1 = esp_timer_get_time();
 
         ESP_LOGD(TAG, "Inference time: %.2f ms", (t1 - t0) / 1000.0);
 
         camera_pipeline_queue_element_index(s_feed_pipeline, cpre->index);
+        
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-esp_err_t pedestrian_detect_task_start(void *arg) {
+void pedestrian_detect_task_start(void *arg) {
     s_feed_pipeline = *((pipeline_handle_t *)arg);
 
     s_box_mutex = xSemaphoreCreateMutex();
     if (!s_box_mutex) {
-        ESP_LOGE(TAG, "mutex alloc failed");
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "Mutex alloc failed");
+        return;
     }
 
     if (xTaskCreatePinnedToCore(detect_task, "detect", 8192, NULL, 7, NULL, 1) != pdPASS) {
-        ESP_LOGE(TAG, "detect task create failed");
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "Detect task create failed");
+        return;
     }
-    return ESP_OK;
 }
 
 int pedestrian_detect_get_boxes(ped_box_t *out, int max) {
@@ -107,9 +119,24 @@ int pedestrian_detect_get_boxes(ped_box_t *out, int max) {
     return n;
 }
 
+void pedestrian_detect_overlay_last_boxes(uint8_t *yuv420) {
+    ped_box_t boxes[PED_DETECT_MAX_BOX];
+    xSemaphoreTake(s_box_mutex, portMAX_DELAY);
+    int n = s_box_count < PED_DETECT_MAX_BOX ? s_box_count : PED_DETECT_MAX_BOX;
+    memcpy(boxes, s_boxes, n * sizeof(ped_box_t));
+    xSemaphoreGive(s_box_mutex);
+
+    for (int i = 0; i < n; i++) {
+        osd_draw_rect_yuv420(yuv420, CAM_WIDTH, CAM_HEIGHT,
+                             boxes[i].x1 * OSD_SCALE_X, boxes[i].y1 * OSD_SCALE_Y,
+                             boxes[i].x2 * OSD_SCALE_X, boxes[i].y2 * OSD_SCALE_Y,
+                             OSD_Y, OSD_U, OSD_V, OSD_THICKNESS);
+    }
+}
+
 #else  /* !CONFIG_APP_ENABLE_AI: stubs, detector model never instantiated */
 
-esp_err_t pedestrian_detect_task_start(void *arg) {
+void pedestrian_detect_task_start(void *arg) {
     (void)arg;
     return ESP_OK;
 }

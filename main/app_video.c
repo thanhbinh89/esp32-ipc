@@ -3,6 +3,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_video_init.h"
+#include "pedestrian_detect_task.h"
 
 #define APP_MIPI_CSI_SCCB_I2C_PORT    CONFIG_APP_MIPI_CSI_SCCB_I2C_PORT
 #define APP_MIPI_CSI_SCCB_I2C_SCL_PIN CONFIG_APP_MIPI_CSI_SCCB_I2C_SCL_PIN

@@ -12,6 +12,7 @@
 #include "app_ethernet.h"
 #include "sdkconfig.h"
 
+#include "app_define.h"
 #include "app_video.h"
 #include "video_task.h"
 #include "pedestrian_detect_task.h"
@@ -22,11 +23,6 @@
 
 static const char *TAG = "main";
 
-#define TASK_AUDIO_STACK_SIZE 4096
-#define TASK_VIDEO_STACK_SIZE 4096
-#define TASK_WEBRTC_STACK_SIZE 4096
-
-
 #define GOT_IP_BIT BIT0
 
 static EventGroupHandle_t s_net_event_group;
@@ -36,7 +32,7 @@ static int s_net_retry_num = 0;
 #endif
 
 #if CONFIG_APP_NETIF_ETH
-/** Event handler for Ethernet events */
+/* Event handler for Ethernet events */
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data) {
     uint8_t mac_addr[6] = {0};
@@ -85,7 +81,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 }
 #endif /* CONFIG_APP_NETIF_WIFI */
 
-/** Event handler for IP_EVENT_ETH_GOT_IP */
+/* Event handler for IP_EVENT_ETH_GOT_IP */
 static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
                                  int32_t event_id, void *event_data) {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
@@ -201,12 +197,12 @@ extern "C" void app_main(void) {
     
     // pedestrian detect init
     ESP_LOGI(TAG, "Starting pedestrian detection task...");
-    ESP_ERROR_CHECK(pedestrian_detect_task_start(&s_feed_pipeline));
+    pedestrian_detect_task_start(&s_feed_pipeline);
 #endif
 
     while (true) {
         // delay to avoid watchdog timer trigger
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 
 }

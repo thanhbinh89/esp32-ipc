@@ -23,11 +23,15 @@ typedef struct {
 /* Create the detector + detection task. Returns the feed pipeline handle the
  * camera task pushes RGB565 (PED_DETECT_WIDTH x PED_DETECT_HEIGHT) frames into,
  * or NULL on failure. */
-esp_err_t pedestrian_detect_task_start(void *arg);
+void pedestrian_detect_task_start(void *arg);
 
 /* Copy the most recent detection boxes (detection-resolution coords) into out.
  * Returns the number of boxes copied (<= max). Thread-safe. */
 int pedestrian_detect_get_boxes(ped_box_t *out, int max);
+
+/* Overlay the most recent detection boxes onto the YUV420 frame (full-res coords).
+ * Thread-safe. */
+void pedestrian_detect_overlay_last_boxes(uint8_t *yuv420);
 
 #ifdef __cplusplus
 }
