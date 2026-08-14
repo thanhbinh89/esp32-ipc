@@ -3,15 +3,14 @@
 #include "esp_check.h"
 #include "esp_log.h"
 
-#define APP_ETH_MDC_GPIO 31
-#define APP_ETH_MDIO_GPIO 52
-#define APP_ETH_PHY_RST_GPIO 51
-#define APP_ETH_PHY_ADDR 1
+#define APP_ETH_MDC_GPIO        CONFIG_ESP_ETH_MDC_GPIO
+#define APP_ETH_MDIO_GPIO       CONFIG_ESP_ETH_MDIO_GPIO
+#define APP_ETH_PHY_RST_GPIO    CONFIG_ESP_ETH_PHY_RST_GPIO
+#define APP_ETH_PHY_ADDR        CONFIG_ESP_ETH_PHY_ADDR
 
-static const char *TAG = "app_eth_init";
+static const char *TAG = "app_eth";
 
-esp_err_t app_eth_init(esp_eth_handle_t *eth_handle_out)
-{
+esp_err_t app_eth_init(esp_eth_handle_t *eth_handle_out) {
     ESP_RETURN_ON_FALSE(eth_handle_out != NULL, ESP_ERR_INVALID_ARG, TAG, "Ethernet handle cannot be NULL");
 
     esp_err_t ret = ESP_OK;

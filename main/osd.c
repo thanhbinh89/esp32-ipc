@@ -2,8 +2,7 @@
 #include "osd.h"
 
 static inline void put_pixel_yuv420(uint8_t *buf, int width, int height,
-                                    int x, int y, uint8_t yc, uint8_t uc, uint8_t vc)
-{
+                                    int x, int y, uint8_t yc, uint8_t uc, uint8_t vc) {
     if (x < 0 || y < 0 || x >= width || y >= height) {
         return;
     }
@@ -21,8 +20,7 @@ static inline void put_pixel_yuv420(uint8_t *buf, int width, int height,
 
 void osd_draw_rect_yuv420(uint8_t *buf, int width, int height,
                           int x1, int y1, int x2, int y2,
-                          uint8_t yc, uint8_t uc, uint8_t vc, int thickness)
-{
+                          uint8_t yc, uint8_t uc, uint8_t vc, int thickness) {
     if (x1 > x2) { int t = x1; x1 = x2; x2 = t; }
     if (y1 > y2) { int t = y1; y1 = y2; y2 = t; }
 

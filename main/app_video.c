@@ -1,14 +1,15 @@
+#include "sdkconfig.h"
 #include "app_video.h"
-
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_video_init.h"
-#define APP_MIPI_CSI_SCCB_I2C_PORT    GPIO_NUM_0
-#define APP_MIPI_CSI_SCCB_I2C_SCL_PIN GPIO_NUM_8
-#define APP_MIPI_CSI_SCCB_I2C_SDA_PIN GPIO_NUM_7
-#define APP_MIPI_CSI_SCCB_I2C_FREQ    100000
-#define APP_MIPI_CSI_SENSOR_RESET_PIN GPIO_NUM_NC
-#define APP_MIPI_CSI_SENSOR_PWDN_PIN  GPIO_NUM_NC
+
+#define APP_MIPI_CSI_SCCB_I2C_PORT    CONFIG_APP_MIPI_CSI_SCCB_I2C_PORT
+#define APP_MIPI_CSI_SCCB_I2C_SCL_PIN CONFIG_APP_MIPI_CSI_SCCB_I2C_SCL_PIN
+#define APP_MIPI_CSI_SCCB_I2C_SDA_PIN CONFIG_APP_MIPI_CSI_SCCB_I2C_SDA_PIN
+#define APP_MIPI_CSI_SCCB_I2C_FREQ    CONFIG_APP_MIPI_CSI_SCCB_I2C_FREQ
+#define APP_MIPI_CSI_SENSOR_RESET_PIN CONFIG_APP_MIPI_CSI_SENSOR_RESET_PIN
+#define APP_MIPI_CSI_SENSOR_PWDN_PIN  CONFIG_APP_MIPI_CSI_SENSOR_PWDN_PIN
 
 static const char *TAG = "app_video";
 static bool s_is_init;
@@ -31,8 +32,7 @@ static const esp_video_init_config_t s_video_config = {
     .csi = &s_csi_config,
 };
 
-esp_err_t app_video_init(void)
-{
+esp_err_t app_video_init(void) {
     if (s_is_init) {
         return ESP_OK;
     }

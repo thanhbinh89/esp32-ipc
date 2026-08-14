@@ -1,4 +1,4 @@
-menu "IPC Configuration"
+menu "IPC Internet"
 
     choice APP_NETIF
         prompt "Network interface"
@@ -14,6 +14,32 @@ menu "IPC Configuration"
             bool "Wi-Fi (esp_wifi_remote)"
     endchoice
 
+        if APP_NETIF_ETH
+            config ESP_ETH_PHY_ADDR
+                int "Ethernet PHY Address"
+                default 1
+                help
+                    The address of the Ethernet PHY on the MDIO bus.
+
+            config ESP_ETH_PHY_RST_GPIO
+                int "Ethernet PHY Reset GPIO"
+                default 51
+                help
+                    The GPIO pin number used to reset the Ethernet PHY.
+
+            config ESP_ETH_MDC_GPIO
+                int "Ethernet MDC GPIO"
+                default 31
+                help
+                    The GPIO pin number used for the Ethernet MDC line.
+
+            config ESP_ETH_MDIO_GPIO
+                int "Ethernet MDIO GPIO"
+                default 52
+                help
+                    The GPIO pin number used for the Ethernet MDIO line.
+        endif
+
         if APP_NETIF_WIFI
             config ESP_WIFI_SSID
                 string "WiFi SSID"
@@ -28,13 +54,9 @@ menu "IPC Configuration"
                     WiFi password (WPA or WPA2) for the app to use.
         endif
 
-    config APP_ENABLE_AI
-        bool "Enable pedestrian detection (AI)"
-        default y
-        help
-            Run the esp-dl pedestrian detector and overlay boxes on the stream.
-            Disable to free internal RAM (the esp-dl model is never instantiated),
-            e.g. when Wi-Fi/esp_hosted is enabled and internal DMA RAM is tight.
+endmenu
+
+menu "IPC Wertc"
 
     config SIGNALING_URL
         string "Signaling URL"
@@ -79,4 +101,145 @@ menu "IPC Configuration"
                 help
                     Enter the crdential for TURN server authentication.
         endif
+
+endmenu
+
+menu "IPC Features"
+
+    config APP_ENABLE_AI
+        bool "Enable pedestrian detection (AI)"
+        default y
+        help
+            Run the esp-dl pedestrian detector and overlay boxes on the stream.
+            Disable to free internal RAM (the esp-dl model is never instantiated),
+            e.g. when Wi-Fi/esp_hosted is enabled and internal DMA RAM is tight.
+        
+endmenu
+
+menu "IPC Video"
+
+    config APP_MIPI_CSI_SCCB_I2C_PORT
+        int "MIPI CSI SCCB I2C Port"
+        default 0
+        help
+            The I2C port number used for the MIPI CSI SCCB interface.
+    
+    config APP_MIPI_CSI_SCCB_I2C_SCL_PIN
+        int "MIPI CSI SCCB I2C SCL Pin"
+        default 8
+        help
+            The GPIO pin number used for the MIPI CSI SCCB I2C SCL line.
+
+    config APP_MIPI_CSI_SCCB_I2C_SDA_PIN
+        int "MIPI CSI SCCB I2C SDA Pin"
+        default 7
+        help
+            The GPIO pin number used for the MIPI CSI SCCB I2C SDA line.
+
+    config APP_MIPI_CSI_SCCB_I2C_FREQ
+        int "MIPI CSI SCCB I2C Frequency"
+        default 100000
+        help
+            The frequency (in Hz) of the MIPI CSI SCCB I2C interface.
+
+    config APP_MIPI_CSI_SENSOR_RESET_PIN
+        int "MIPI CSI Sensor Reset Pin"
+        default -1
+        help
+            The GPIO pin number used for the MIPI CSI sensor reset line.
+
+    config APP_MIPI_CSI_SENSOR_PWDN_PIN
+        int "MIPI CSI Sensor Power Down Pin"
+        default -1
+        help
+            The GPIO pin number used for the MIPI CSI sensor power down line.
+
+endmenu
+
+menu "IPC Audio"
+
+    config APP_AUDIO_I2C_NUM
+        int "Audio I2C Port"
+        default 0
+        help
+            The I2C port number used for the audio codec.
+    
+    config APP_AUDIO_I2S_NUM
+        int "Audio I2S Port"
+        default 0
+        help
+            The I2S port number used for audio input/output.
+
+    config APP_AUDIO_I2C_SCL_IO
+        int "Audio I2C SCL Pin"
+        default 8
+        help
+            The GPIO pin number used for the audio codec I2C SCL line.
+
+    config APP_AUDIO_I2C_SDA_IO
+        int "Audio I2C SDA Pin"
+        default 7
+        help
+            The GPIO pin number used for the audio codec I2C SDA line.
+
+    config APP_AUDIO_I2S_MCK_IO
+        int "Audio I2S MCK Pin"
+        default 13
+        help
+            The GPIO pin number used for the audio codec I2S MCK line.
+
+    config APP_AUDIO_I2S_BCK_IO
+        int "Audio I2S BCK Pin"
+        default 12
+        help
+            The GPIO pin number used for the audio codec I2S BCK line.
+
+    config APP_AUDIO_I2S_WS_IO
+        int "Audio I2S WS Pin"
+        default 10
+        help
+            The GPIO pin number used for the audio codec I2S WS line.
+    
+    config APP_AUDIO_I2S_DO_IO
+        int "Audio I2S DO Pin"
+        default 9
+        help
+            The GPIO pin number used for the audio codec I2S DO line.
+
+    config APP_AUDIO_I2S_DI_IO
+        int "Audio I2S DI Pin"
+        default 11
+        help
+            The GPIO pin number used for the audio codec I2S DI line.
+
+    config APP_AUDIO_PA_IO
+        int "Audio PA Pin"
+        default 53
+        help
+            The GPIO pin number used for the audio power amplifier.
+
+    config APP_AUDIO_SAMPLE_RATE
+        int "Audio Sample Rate"
+        default 8000
+        help
+            The sample rate (in Hz) for audio input/output.
+
+    config APP_AUDIO_MCLK_MULTIPLE
+        int "Audio MCLK Multiple"
+        default 384
+        help
+            The multiple of the sample rate used to generate the audio master clock (MCLK).
+
+    config APP_AUDIO_VOLUME
+        int "Audio Volume"
+        default 70
+        help
+            The volume level (0-100) for audio output.
+
+    config APP_AUDIO_MIC_GAIN_DB
+        string "Audio Microphone Gain (dB)"
+        default "30.0"
+        help
+            The gain (in dB) applied to the audio input from the microphone.
+            
 endmenu

@@ -8,8 +8,7 @@ static const char *path = "pedestrian_det";
 #endif
 namespace pedestrian_detect {
 
-Pico::Pico(const char *model_name)
-{
+Pico::Pico(const char *model_name) {
 #if !CONFIG_PEDESTRIAN_DETECT_MODEL_IN_SDCARD
     m_model = new dl::Model(
         path, model_name, static_cast<fbs::model_location_type_t>(CONFIG_PEDESTRIAN_DETECT_MODEL_LOCATION));
@@ -28,8 +27,7 @@ Pico::Pico(const char *model_name)
 
 } // namespace pedestrian_detect
 
-PedestrianDetect::PedestrianDetect(const char *sdcard_model_dir, model_type_t model_type)
-{
+PedestrianDetect::PedestrianDetect(const char *sdcard_model_dir, model_type_t model_type) {
     switch (model_type) {
     case model_type_t::PICO_S8_V1:
 #if CONFIG_PEDESTRIAN_DETECT_PICO_S8_V1

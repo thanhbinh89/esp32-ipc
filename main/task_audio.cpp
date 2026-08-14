@@ -1,4 +1,4 @@
-#include "audio_task.h"
+#include "task_audio.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -6,16 +6,15 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_codec_dev.h"
-#include "app_audio_codec.h"
-#include "webrtc_task.h"
+#include "app_audio.h"
+#include "task_webrtc.h"
 
 /* 20 ms @ 8 kHz mono, int16 -> 160 samples -> 160 PCMA bytes per packet. */
 #define AUDIO_READ_BYTES 320
 
 static const char *TAG = "audio";
 
-static uint8_t linear16_to_g711a(int16_t sample)
-{
+static uint8_t linear16_to_g711a(int16_t sample) {
     const uint16_t seg_end[8] = {0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF};
     uint8_t mask;
     uint8_t aval;
@@ -45,9 +44,10 @@ static uint8_t linear16_to_g711a(int16_t sample)
     return aval ^ mask;
 }
 
-void audio_task(void *arg)
-{
-    esp_codec_dev_handle_t codec = app_audio_codec_get_handle();
+void task_audio(void *arg) {
+    ESP_LOGD(TAG, "task_audio started");
+
+    esp_codec_dev_handle_t codec = app_audio_get_handle();
     if (!codec) {
         ESP_LOGE(TAG, "codec not initialized");
         vTaskDelete(NULL);

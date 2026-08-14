@@ -9,8 +9,8 @@
 extern "C" {
 #endif
 
-/* Shared WebRTC state, owned by webrtc_task and read by video_task/audio_task.
- * video_task pushes H.264 via peer_connection_send_video(); audio_task pushes
+/* Shared WebRTC state, owned by task_webrtc and read by video_task/task_audio.
+ * video_task pushes H.264 via peer_connection_send_video(); task_audio pushes
  * G.711-A via peer_connection_send_audio(). Both gate on eState and serialise
  * against peer_connection_loop() using g_pc_lock. */
 extern PeerConnection *g_pc;
@@ -21,7 +21,7 @@ bool webrtc_take_keyframe_request(void);
 
 /* Creates the PeerConnection, connects signaling, then polls the PC + signaling
  * loops forever. Must be started after networking has an IP. */
-void webrtc_task(void *arg);
+void task_webrtc(void *arg);
 
 #ifdef __cplusplus
 }

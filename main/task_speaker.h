@@ -4,7 +4,7 @@
 extern "C" {
 #endif
 
-void audio_task(void *arg);
+void task_speaker(void *arg);
 
 #ifdef __cplusplus
 }

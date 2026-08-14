@@ -1,4 +1,4 @@
-#include "webrtc_task.h"
+#include "task_webrtc.h"
 
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
@@ -19,8 +19,7 @@ SemaphoreHandle_t g_pc_lock = nullptr;
 static bool s_datachannel_open = false;
 static volatile bool s_keyframe_requested = false;
 
-static void on_ice_state_change(PeerConnectionState state, void *user_data)
-{
+static void on_ice_state_change(PeerConnectionState state, void *user_data) {
     ESP_LOGI(TAG, "PeerConnectionState: %d", state);
     eState = state;
     if (state != PEER_CONNECTION_COMPLETED) {
@@ -28,38 +27,32 @@ static void on_ice_state_change(PeerConnectionState state, void *user_data)
     }
 }
 
-static void on_dc_message(char *msg, size_t len, void *user_data, uint16_t sid)
-{
+static void on_dc_message(char *msg, size_t len, void *user_data, uint16_t sid) {
     ESP_LOGD(TAG, "datachannel msg sid=%u len=%u", sid, (unsigned)len);
 }
 
-static void on_dc_open(void *user_data)
-{
+static void on_dc_open(void *user_data) {
     ESP_LOGI(TAG, "datachannel open");
     s_datachannel_open = true;
 }
 
-static void on_dc_close(void *user_data)
-{
+static void on_dc_close(void *user_data) {
     ESP_LOGI(TAG, "datachannel close");
     s_datachannel_open = false;
 }
 
-static void on_request_keyframe(void *user_data)
-{
+static void on_request_keyframe(void *user_data) {
     ESP_LOGI(TAG, "request keyframe");
     s_keyframe_requested = true;
 }
 
-bool webrtc_take_keyframe_request(void)
-{
+bool webrtc_take_keyframe_request(void) {
     bool requested = s_keyframe_requested;
     s_keyframe_requested = false;
     return requested;
 }
 
-static void peer_connection_task(void *arg)
-{
+static void peer_connection_task(void *arg) {
     while (true) {
         if (xSemaphoreTake(g_pc_lock, portMAX_DELAY) == pdTRUE) {
             peer_connection_loop(g_pc);
@@ -71,8 +64,9 @@ static void peer_connection_task(void *arg)
     vTaskDelete(NULL);
 }
 
-void webrtc_task(void *arg)
-{
+void task_webrtc(void *arg) {
+    ESP_LOGI(TAG, "task_webrtc started");
+
     PeerConfiguration cfg = {};
     cfg.ice_servers[0].urls = CONFIG_STUN_URL;
     if (CONFIG_TURN) {

@@ -19,7 +19,7 @@
 #include "pedestrian_detect_task.h"
 #include "app_camera_pipeline.hpp"
 #include "osd.h"
-#include "webrtc_task.h"
+#include "task_webrtc.h"
 
 static const char *TAG = "video";
 
@@ -65,8 +65,7 @@ typedef struct {
     uint32_t stat_bytes;
 } video_ctx_t;
 
-static esp_err_t h264_set_ctrl(int fd, uint32_t id, int32_t value, const char *what)
-{
+static esp_err_t h264_set_ctrl(int fd, uint32_t id, int32_t value, const char *what) {
     struct v4l2_ext_control control[1] = {};
     control[0].id = id;
     control[0].value = value;
@@ -81,8 +80,7 @@ static esp_err_t h264_set_ctrl(int fd, uint32_t id, int32_t value, const char *w
     return ESP_OK;
 }
 
-static esp_err_t h264_force_idr(int fd)
-{
+static esp_err_t h264_force_idr(int fd) {
 #ifdef V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME
     return h264_set_ctrl(fd, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 1, "H.264 force key frame");
 #else
@@ -97,8 +95,7 @@ static esp_err_t h264_force_idr(int fd)
 
 /* PPA-convert one full YUV420 frame to a downscaled RGB565 buffer. Blocking. */
 static void feed_detector(ppa_client_handle_t ppa, pipeline_handle_t feed,
-                          uint8_t *yuv420)
-{
+                          uint8_t *yuv420) {
     if (!feed) {
         return;
     }
@@ -145,8 +142,7 @@ static void feed_detector(ppa_client_handle_t ppa, pipeline_handle_t feed,
     camera_pipeline_done_element(feed, el);
 }
 
-static void overlay_boxes(uint8_t *yuv420)
-{
+static void overlay_boxes(uint8_t *yuv420) {
     ped_box_t boxes[PED_DETECT_MAX_BOX];
     int n = pedestrian_detect_get_boxes(boxes, PED_DETECT_MAX_BOX);
 
@@ -158,8 +154,7 @@ static void overlay_boxes(uint8_t *yuv420)
     }
 }
 
-static void video_capture_task(void *arg)
-{
+static void video_capture_task(void *arg) {
     video_ctx_t *ctx = (video_ctx_t *)arg;
 
     while (true) {
@@ -176,8 +171,7 @@ static void video_capture_task(void *arg)
     }
 }
 
-static void video_encode_task(void *arg)
-{
+static void video_encode_task(void *arg) {
     video_ctx_t *ctx = (video_ctx_t *)arg;
 
     while (true) {
@@ -196,7 +190,7 @@ static void video_encode_task(void *arg)
                 ESP_LOGW(TAG, "keyframe requested: force IDR failed");
             }
         }
-
+#if CONFIG_APP_ENABLE_AI
         /* Share the post-ISP YUV420 frame with the detector (PPA -> RGB565). Done
          * before OSD so the detector sees the unannotated frame. */
         feed_detector(ctx->ppa_handle, ctx->feed_pipeline, frame);
@@ -204,6 +198,7 @@ static void video_encode_task(void *arg)
         /* Overlay the latest detection boxes onto the YUV420 frame, then flush CPU
          * writes so the encoder DMA reads the annotated pixels. */
         overlay_boxes(frame);
+#endif
         esp_cache_msync(frame, ctx->cap_buffer_len[cap_item.buf.index],
                         ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 
@@ -243,8 +238,9 @@ static void video_encode_task(void *arg)
 }
 
 
-void video_task(void *arg)
-{
+void video_task(void *arg) {
+    ESP_LOGI(TAG, "video_task started");
+
     static video_ctx_t ctx = {};
     int type;
     struct v4l2_format format;

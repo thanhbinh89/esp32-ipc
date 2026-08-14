@@ -37,8 +37,7 @@ struct camera_pipeline_stream {
     SemaphoreHandle_t ready_sem;           /*!< Semaphore used for signaling when buffer elements are ready for processing. */
 };
 
-esp_err_t camera_element_pipeline_new(camera_pipeline_cfg_t *cfg, pipeline_handle_t *ret_item)
-{
+esp_err_t camera_element_pipeline_new(camera_pipeline_cfg_t *cfg, pipeline_handle_t *ret_item) {
     esp_err_t ret = ESP_OK;
     struct camera_pipeline_stream *stream = NULL;
 
@@ -111,8 +110,7 @@ err:
     return ret;
 }
 
-esp_err_t camera_element_pipeline_delete(pipeline_handle_t pipeline)
-{
+esp_err_t camera_element_pipeline_delete(pipeline_handle_t pipeline) {
     struct camera_pipeline_stream *stream = (struct camera_pipeline_stream *)pipeline;
     ESP_RETURN_ON_FALSE(stream, ESP_ERR_INVALID_ARG, TAG, "Invalid pipeline handle");
 
@@ -133,8 +131,7 @@ esp_err_t camera_element_pipeline_delete(pipeline_handle_t pipeline)
     return ESP_OK;
 }
 
-esp_err_t camera_pipeline_queue_element(pipeline_handle_t pipline, struct camera_pipeline_buffer_element *element)
-{
+esp_err_t camera_pipeline_queue_element(pipeline_handle_t pipline, struct camera_pipeline_buffer_element *element) {
     struct camera_pipeline_stream *stream = (struct camera_pipeline_stream *)pipline;
     if (!stream) {
         return ESP_ERR_INVALID_ARG;
@@ -153,8 +150,7 @@ esp_err_t camera_pipeline_queue_element(pipeline_handle_t pipline, struct camera
     return ESP_OK;
 }
 
-esp_err_t camera_pipeline_queue_element_index(pipeline_handle_t pipline, int index)
-{
+esp_err_t camera_pipeline_queue_element_index(pipeline_handle_t pipline, int index) {
     esp_err_t ret;
     struct camera_pipeline_buffer_element *element;
 
@@ -169,8 +165,7 @@ esp_err_t camera_pipeline_queue_element_index(pipeline_handle_t pipline, int ind
     return ret;
 }
 
-struct camera_pipeline_buffer_element *camera_pipeline_get_queued_element(pipeline_handle_t pipline)
-{
+struct camera_pipeline_buffer_element *camera_pipeline_get_queued_element(pipeline_handle_t pipline) {
     struct camera_pipeline_buffer_element *element = NULL;
 
     struct camera_pipeline_stream *stream = (struct camera_pipeline_stream *)pipline;
@@ -189,8 +184,7 @@ struct camera_pipeline_buffer_element *camera_pipeline_get_queued_element(pipeli
     return element;
 }
 
-struct camera_pipeline_buffer_element *camera_pipeline_get_done_element(pipeline_handle_t pipline)
-{
+struct camera_pipeline_buffer_element *camera_pipeline_get_done_element(pipeline_handle_t pipline) {
     struct camera_pipeline_buffer_element *element = NULL;
 
     struct camera_pipeline_stream *stream = (struct camera_pipeline_stream *)pipline;
@@ -209,8 +203,7 @@ struct camera_pipeline_buffer_element *camera_pipeline_get_done_element(pipeline
     return element;
 }
 
-esp_err_t IRAM_ATTR camera_pipeline_done_element(pipeline_handle_t pipline, struct camera_pipeline_buffer_element *element)
-{
+esp_err_t IRAM_ATTR camera_pipeline_done_element(pipeline_handle_t pipline, struct camera_pipeline_buffer_element *element) {
     struct camera_pipeline_stream *stream = (struct camera_pipeline_stream *)pipline;
     if (!stream) {
         return ESP_ERR_INVALID_ARG;
@@ -240,8 +233,7 @@ esp_err_t IRAM_ATTR camera_pipeline_done_element(pipeline_handle_t pipline, stru
     return ESP_OK;
 }
 
-struct camera_pipeline_buffer_element *camera_pipeline_recv_element(pipeline_handle_t pipline, uint32_t ticks)
-{
+struct camera_pipeline_buffer_element *camera_pipeline_recv_element(pipeline_handle_t pipline, uint32_t ticks) {
     BaseType_t ret;
     struct camera_pipeline_buffer_element *element;
 

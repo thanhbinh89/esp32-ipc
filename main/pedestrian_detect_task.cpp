@@ -23,8 +23,7 @@ static int s_box_count = 0;
 static PedestrianDetect detect;
 static pipeline_handle_t s_feed_pipeline = NULL;
 
-static void store_results(const std::list<dl::detect::result_t> &results)
-{
+static void store_results(const std::list<dl::detect::result_t> &results) {
     int n = 0;
     xSemaphoreTake(s_box_mutex, portMAX_DELAY);
     for (const auto &res : results) {
@@ -52,10 +51,9 @@ static void store_results(const std::list<dl::detect::result_t> &results)
     }
 }
 
-static void detect_task(void *arg)
-{
+static void detect_task(void *arg) {
     // log entry to confirm task is running
-    ESP_LOGI(TAG, "detect task started");
+    ESP_LOGI(TAG, "pedestrian detection task started");
 
     while (true) {
         camera_pipeline_buffer_element *cpre = camera_pipeline_recv_element(s_feed_pipeline, portMAX_DELAY);
@@ -82,8 +80,7 @@ static void detect_task(void *arg)
     }
 }
 
-esp_err_t pedestrian_detect_task_start(void *arg)
-{
+esp_err_t pedestrian_detect_task_start(void *arg) {
     s_feed_pipeline = *((pipeline_handle_t *)arg);
 
     s_box_mutex = xSemaphoreCreateMutex();
@@ -99,8 +96,7 @@ esp_err_t pedestrian_detect_task_start(void *arg)
     return ESP_OK;
 }
 
-int pedestrian_detect_get_boxes(ped_box_t *out, int max)
-{
+int pedestrian_detect_get_boxes(ped_box_t *out, int max) {
     if (!s_box_mutex) {
         return 0;
     }
@@ -113,14 +109,12 @@ int pedestrian_detect_get_boxes(ped_box_t *out, int max)
 
 #else  /* !CONFIG_APP_ENABLE_AI: stubs, detector model never instantiated */
 
-esp_err_t pedestrian_detect_task_start(void *arg)
-{
+esp_err_t pedestrian_detect_task_start(void *arg) {
     (void)arg;
     return ESP_OK;
 }
 
-int pedestrian_detect_get_boxes(ped_box_t *out, int max)
-{
+int pedestrian_detect_get_boxes(ped_box_t *out, int max) {
     (void)out;
     (void)max;
     return 0;
