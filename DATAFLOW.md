@@ -137,13 +137,13 @@ sequenceDiagram
 
 ### 2.3 Buffer ownership over one frame
 
-| Stage | Owner of `cap_mmap[i]` | Notes |
-| --- | --- | --- |
-| after `VIDIOC_QBUF` | camera DMA | driver writes ISP output |
-| after `VIDIOC_DQBUF` | `video_cap` | descriptor pushed to `cap_queue` |
-| dequeued from `cap_queue` | `video_enc` | read by PPA, then written in place by OSD |
-| `VIDIOC_QBUF(OUTPUT, USERPTR)` .. `DQBUF(CAPTURE)` | H.264 encoder | read-only for the encoder |
-| after `VIDIOC_QBUF(cap_fd)` | camera DMA again | cycle repeats |
+| Stage                                                  | Owner of`cap_mmap[i]` | Notes                                     |
+| ------------------------------------------------------ | ----------------------- | ----------------------------------------- |
+| after`VIDIOC_QBUF`                                   | camera DMA              | driver writes ISP output                  |
+| after`VIDIOC_DQBUF`                                  | `video_cap`           | descriptor pushed to`cap_queue`         |
+| dequeued from`cap_queue`                             | `video_enc`           | read by PPA, then written in place by OSD |
+| `VIDIOC_QBUF(OUTPUT, USERPTR)` .. `DQBUF(CAPTURE)` | H.264 encoder           | read-only for the encoder                 |
+| after`VIDIOC_QBUF(cap_fd)`                           | camera DMA again        | cycle repeats                             |
 
 The frame is never copied. OSD boxes are drawn **into the same buffer the encoder
 reads**, which is why the `DIR_C2M` writeback before `VIDIOC_QBUF(OUTPUT)` is mandatory.
@@ -197,7 +197,7 @@ sequenceDiagram
         DT->>FP: camera_pipeline_recv_element(portMAX_DELAY)
         FP-->>DT: element (RGB565 640x360)
         DT->>DT: build dl::image::img_t<br/>{data, 640, 360, DL_IMAGE_PIX_TYPE_RGB565}
-        DT->>DL: s_detect.run(img)
+        DT->>DL: s_detect->run(img)
         Note right of DL: ImagePreprocessor resize to 224x224x3<br/>mean {0,0,0} std {1,1,1}<br/>Pico s8 v1 quantised inference<br/>PicoPostprocessor score 0.5, NMS 0.5, top-k 10<br/>strides {8,8,4,4} {16,16,8,8} {32,32,16,16}
         DL-->>DT: list of dl::detect::result_t (box in 640x360 coords)
         DT->>BSTORE: store_results() - take mutex, copy up to 10 boxes, give mutex
@@ -275,18 +275,18 @@ constructs the `ImagePreprocessor` without that capability flag
 
 ### 4.3 PPA conversion parameters
 
-| Field | Value |
-| --- | --- |
-| `in.srm_cm` | `PPA_SRM_COLOR_MODE_YUV420` |
-| `in.pic_w/h`, `in.block_w/h` | 1920 x 1080 (full frame, no crop) |
-| `in.yuv_range` | `PPA_COLOR_RANGE_LIMIT` |
-| `in.yuv_std` | `PPA_COLOR_CONV_STD_RGB_YUV_BT601` |
-| `out.srm_cm` | `PPA_SRM_COLOR_MODE_RGB565` |
-| `out.pic_w/h` | 640 x 360, `buffer_size` 460 800 B |
-| `scale_x`, `scale_y` | 640/1920 and 360/1080 = 0.333… |
-| `rotation_angle` | `PPA_SRM_ROTATION_ANGLE_0` |
-| `byte_swap` | `false` |
-| `mode` | `PPA_TRANS_MODE_BLOCKING` |
+| Field                            | Value                                |
+| -------------------------------- | ------------------------------------ |
+| `in.srm_cm`                    | `PPA_SRM_COLOR_MODE_YUV420`        |
+| `in.pic_w/h`, `in.block_w/h` | 1920 x 1080 (full frame, no crop)    |
+| `in.yuv_range`                 | `PPA_COLOR_RANGE_LIMIT`            |
+| `in.yuv_std`                   | `PPA_COLOR_CONV_STD_RGB_YUV_BT601` |
+| `out.srm_cm`                   | `PPA_SRM_COLOR_MODE_RGB565`        |
+| `out.pic_w/h`                  | 640 x 360,`buffer_size` 460 800 B  |
+| `scale_x`, `scale_y`         | 640/1920 and 360/1080 = 0.333…      |
+| `rotation_angle`               | `PPA_SRM_ROTATION_ANGLE_0`         |
+| `byte_swap`                    | `false`                            |
+| `mode`                         | `PPA_TRANS_MODE_BLOCKING`          |
 
 Blocking mode means the encode task stalls for the duration of the PPA operation on
 every frame that gets a free feed element.
@@ -354,10 +354,10 @@ So the speaker path exists only as dead code plus a 625 KB payload in the app pa
 PSRAM buffers are shared between CPU and DMA masters (ISP, PPA, H.264), so every
 handoff needs an explicit `esp_cache_msync()` in the right direction.
 
-| Call site | Buffer | Flags | Why |
-| --- | --- | --- | --- |
-| [video_task.cpp:130](main/video_task.cpp#L130) | RGB565 feed element | `DIR_M2C` | PPA (DMA) just wrote it; **invalidate** so the detector's CPU reads see fresh bytes instead of stale cache lines |
-| [video_task.cpp:209](main/video_task.cpp#L209) | full YUV420 capture buffer | `DIR_C2M \| UNALIGNED` | the CPU just drew OSD boxes into it; **write back** so the H.264 DMA sees them |
+| Call site                                     | Buffer                     | Flags                   | Why                                                                                                                   |
+| --------------------------------------------- | -------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| [video_task.cpp:130](main/video_task.cpp#L130) | RGB565 feed element        | `DIR_M2C`             | PPA (DMA) just wrote it;**invalidate** so the detector's CPU reads see fresh bytes instead of stale cache lines |
+| [video_task.cpp:209](main/video_task.cpp#L209) | full YUV420 capture buffer | `DIR_C2M \| UNALIGNED` | the CPU just drew OSD boxes into it;**write back** so the H.264 DMA sees them                                   |
 
 The `UNALIGNED` flag is required on the capture buffer because its length
 (3 110 400 B for 1080p) and mmap address are not guaranteed to be multiples of the
@@ -370,20 +370,20 @@ multiple of 128.
 
 ## 7. Rates and timing budget
 
-| Stage | Cost / rate | Source |
-| --- | --- | --- |
-| Sensor capture | 30 fps, 33.3 ms period | `CONFIG_CAMERA_OV5647_MIPI_RAW10_1920X1080_30FPS` |
-| PPA 1080p -> 640x360 + colour convert | blocking, per frame with a free element | `PPA_TRANS_MODE_BLOCKING` |
-| OSD draw | perimeter x 4 px x N boxes, N <= 10 | negligible vs. the rest |
-| H.264 encode | hardware, target 1 Mbps, QP 35–45, IDR every 5 frames | [video_task.h:12-15](main/video_task.h#L12-L15) |
-| ESP-DL preprocess (P4) | ~14.4 ms | [component README](components/pedestrian_detect/README.md) |
-| ESP-DL inference (P4) | ~51.5 ms | same |
-| ESP-DL postprocess (P4) | ~1.2 ms | same |
-| Detector loop total | ~67 ms + 10 ms `vTaskDelay` ≈ **~13 detections/s** | — |
-| Audio | 50 packets/s, 20 ms each | `AUDIO_READ_BYTES = 320` |
-| `peer_connection_loop()` | polled every 1 ms | [task_webrtc.cpp:61](main/task_webrtc.cpp#L61) |
-| `peer_signaling_loop()` | polled every 10 ms | [task_webrtc.cpp:109](main/task_webrtc.cpp#L109) |
-| Stats log | 1 Hz | [video_task.cpp:396](main/video_task.cpp#L396) |
+| Stage                                 | Cost / rate                                            | Source                                                    |
+| ------------------------------------- | ------------------------------------------------------ | --------------------------------------------------------- |
+| Sensor capture                        | 30 fps, 33.3 ms period                                 | `CONFIG_CAMERA_OV5647_MIPI_RAW10_1920X1080_30FPS`       |
+| PPA 1080p -> 640x360 + colour convert | blocking, per frame with a free element                | `PPA_TRANS_MODE_BLOCKING`                               |
+| OSD draw                              | perimeter x 4 px x N boxes, N <= 10                    | negligible vs. the rest                                   |
+| H.264 encode                          | hardware, target 1 Mbps, QP 35–45, IDR every 5 frames | [video_task.h:12-15](main/video_task.h#L12-L15)            |
+| ESP-DL preprocess (P4)                | ~14.4 ms                                               | [component README](components/pedestrian_detect/README.md) |
+| ESP-DL inference (P4)                 | ~51.5 ms                                               | same                                                      |
+| ESP-DL postprocess (P4)               | ~1.2 ms                                                | same                                                      |
+| Detector loop total                   | ~67 ms + 10 ms `vTaskDelay` ≈ **~13 detections/s** | —                                                        |
+| Audio                                 | 50 packets/s, 20 ms each                               | `AUDIO_READ_BYTES = 320`                                |
+| `peer_connection_loop()`            | polled every 1 ms                                      | [task_webrtc.cpp:61](main/task_webrtc.cpp#L61)             |
+| `peer_signaling_loop()`             | polled every 10 ms                                     | [task_webrtc.cpp:109](main/task_webrtc.cpp#L109)           |
+| Stats log                             | 1 Hz                                                   | [video_task.cpp:396](main/video_task.cpp#L396)             |
 
 **Consequence:** the detector runs at roughly 40 % of the video frame rate, so a given
 box set is drawn onto 2–3 consecutive encoded frames before being refreshed. Fast-moving
@@ -421,14 +421,14 @@ graph TD
     N -- no --> O["stat_send_ok++"]
 ```
 
-| Drop point | Counter | Effect |
-| --- | --- | --- |
-| `cap_queue` full | `stat_cap_drop` | frame lost **and** the V4L2 buffer is leaked (§10) |
-| no free feed element | *(none)* | detection skipped for that frame; video unaffected |
-| PPA failure | *(none)* | element returned unused, detection skipped |
-| PC not `COMPLETED` | *(none)* | encoded frame discarded before send |
-| `g_pc_lock` 2 ms timeout | `stat_send_fail` | encoded frame discarded |
-| `peer_connection_send_video() < 0` | `stat_send_fail` | frame rejected by libpeer (ring buffer full) |
+| Drop point                           | Counter            | Effect                                                   |
+| ------------------------------------ | ------------------ | -------------------------------------------------------- |
+| `cap_queue` full                   | `stat_cap_drop`  | frame lost**and** the V4L2 buffer is leaked (§10) |
+| no free feed element                 | *(none)*         | detection skipped for that frame; video unaffected       |
+| PPA failure                          | *(none)*         | element returned unused, detection skipped               |
+| PC not`COMPLETED`                  | *(none)*         | encoded frame discarded before send                      |
+| `g_pc_lock` 2 ms timeout           | `stat_send_fail` | encoded frame discarded                                  |
+| `peer_connection_send_video() < 0` | `stat_send_fail` | frame rejected by libpeer (ring buffer full)             |
 
 The 1 Hz stats line is the observability surface for all of this:
 
@@ -487,25 +487,21 @@ Issues visible specifically in the flow of data. Structural issues are listed in
    runs, `ready_sem` is never given, and `detect_task` blocks forever in
    `camera_pipeline_recv_element(portMAX_DELAY)`. `s_box_count` stays 0 and no boxes are
    ever drawn. Fix: allocate the pipeline before creating the camera task.
-
 2. **Dropped capture buffers are never returned to the driver.** In
    [video_task.cpp:153-157](main/video_task.cpp#L153-L157) the `VIDIOC_QBUF` on the
    `xQueueSend` failure path is commented out. With `CAP_BUF_COUNT = 3`, three drops
    exhaust the pool and `VIDIOC_DQBUF` blocks permanently — the stream stops rather than
    degrading. Uncommenting the re-queue turns this into a clean frame drop.
-
 3. **Unbounded lock wait in the audio task.** `audio` takes `g_pc_lock` with
    `portMAX_DELAY` while `peer` holds it across the whole of `peer_connection_loop()`.
    A slow loop iteration stalls audio capture; because `esp_codec_dev_read()` is not
    being called during the stall, the I2S RX DMA ring overruns and samples are lost.
    The video path avoids this with its 2 ms timeout.
-
 4. **Stats counters are non-atomic across tasks.** `stat_cap` / `stat_cap_drop` are
    incremented from `video_cap` while `stat_enc` and friends are incremented from
    `video_enc`, and the `camera` task reads and zeroes all of them without
    synchronisation. Harmless for diagnostics, but the numbers can be off by one and a
    reset can race with an increment.
-
 5. **`enc_out_buf.bytesused` is read twice.** The send path caches it into `bytesused`
    but the guard condition re-reads `enc_out_buf.bytesused`
    ([video_task.cpp:231](main/video_task.cpp#L231)). Equivalent today; a latent

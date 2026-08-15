@@ -12,6 +12,12 @@ menu "IPC Internet"
 
         config APP_NETIF_WIFI
             bool "Wi-Fi (esp_wifi_remote)"
+            select ESP_HOSTED_ENABLED
+            help
+                Selects ESP_HOSTED_ENABLED so the esp_hosted host driver is compiled
+                in. On Ethernet builds it stays off (see sdkconfig.defaults): its
+                initialiser is a global constructor that claims internal DMA RAM
+                before app_main and asserts if the allocation fails.
     endchoice
 
         if APP_NETIF_ETH

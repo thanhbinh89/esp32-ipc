@@ -5,6 +5,7 @@
 #if CONFIG_APP_ENABLE_AI
 
 #include <string.h>
+#include <new>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -32,7 +33,11 @@ static const char *TAG = "ped_detect";
 static SemaphoreHandle_t s_box_mutex = NULL;
 static ped_box_t s_boxes[PED_DETECT_MAX_BOX];
 static int s_box_count = 0;
-static PedestrianDetect s_detect;
+/* Constructed in pedestrian_detect_task_start(), not statically: the esp-dl model
+ * claims internal RAM on construction, and a file-scope instance would do that from
+ * a global constructor — before app_main and before other components' constructors
+ * (esp_hosted allocates its DMA mempool from one), leaving them to fail at boot. */
+static PedestrianDetect *s_detect = NULL;
 static pipeline_handle_t s_feed_pipeline = NULL;
 
 static void store_results(const std::list<dl::detect::result_t> &results) {
@@ -81,7 +86,7 @@ static void detect_task(void *arg) {
 
         int64_t t0 = esp_timer_get_time();
 
-        store_results(s_detect.run(img));
+        store_results(s_detect->run(img));
 
         int64_t t1 = esp_timer_get_time();
 
@@ -102,21 +107,16 @@ void pedestrian_detect_task_start(void *arg) {
         return;
     }
 
+    s_detect = new (std::nothrow) PedestrianDetect();
+    if (!s_detect) {
+        ESP_LOGE(TAG, "Detector alloc failed");
+        return;
+    }
+
     if (xTaskCreatePinnedToCore(detect_task, "detect", 8192, NULL, 7, NULL, 1) != pdPASS) {
         ESP_LOGE(TAG, "Detect task create failed");
         return;
     }
-}
-
-int pedestrian_detect_get_boxes(ped_box_t *out, int max) {
-    if (!s_box_mutex) {
-        return 0;
-    }
-    xSemaphoreTake(s_box_mutex, portMAX_DELAY);
-    int n = s_box_count < max ? s_box_count : max;
-    memcpy(out, s_boxes, n * sizeof(ped_box_t));
-    xSemaphoreGive(s_box_mutex);
-    return n;
 }
 
 void pedestrian_detect_overlay_last_boxes(uint8_t *yuv420) {
@@ -138,13 +138,6 @@ void pedestrian_detect_overlay_last_boxes(uint8_t *yuv420) {
 
 void pedestrian_detect_task_start(void *arg) {
     (void)arg;
-    return ESP_OK;
-}
-
-int pedestrian_detect_get_boxes(ped_box_t *out, int max) {
-    (void)out;
-    (void)max;
-    return 0;
 }
 
 #endif /* CONFIG_APP_ENABLE_AI */

@@ -174,14 +174,6 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "audio codec init failed; running without audio");
     }
     
-    // video task
-    ESP_LOGI(TAG, "Starting video tasks...");
-    xTaskCreatePinnedToCore(video_task, "camera", TASK_VIDEO_STACK_SIZE, s_feed_pipeline, 5, NULL, 0);
-    
-    // webrtc task
-    ESP_LOGI(TAG, "Starting WebRTC tasks...");
-    xTaskCreatePinnedToCore(task_webrtc, "webrtc", TASK_WEBRTC_STACK_SIZE, NULL, 6, NULL, 0);
-
 #if CONFIG_APP_ENABLE_AI
     // video pipeline init
     camera_pipeline_cfg_t feed_cfg = {
@@ -199,6 +191,14 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Starting pedestrian detection task...");
     pedestrian_detect_task_start(&s_feed_pipeline);
 #endif
+
+    // video task
+    ESP_LOGI(TAG, "Starting video tasks...");
+    xTaskCreatePinnedToCore(video_task, "camera", TASK_VIDEO_STACK_SIZE, s_feed_pipeline, 5, NULL, 0);
+    
+    // webrtc task
+    ESP_LOGI(TAG, "Starting WebRTC tasks...");
+    xTaskCreatePinnedToCore(task_webrtc, "webrtc", TASK_WEBRTC_STACK_SIZE, NULL, 6, NULL, 0);
 
     while (true) {
         // delay to avoid watchdog timer trigger

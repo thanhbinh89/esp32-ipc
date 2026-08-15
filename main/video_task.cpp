@@ -153,7 +153,7 @@ static void video_capture_task(void *arg) {
         if (xQueueSend(s_ctx.cap_queue, &item, 0) != pdTRUE) {
             s_ctx.stat_cap_drop++;
 
-            // ESP_ERROR_CHECK(ioctl(s_ctx.cap_fd, VIDIOC_QBUF, &item.buf));
+            ESP_ERROR_CHECK(ioctl(s_ctx.cap_fd, VIDIOC_QBUF, &item.buf));
         }
     }
 }

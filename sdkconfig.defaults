@@ -21,6 +21,11 @@ CONFIG_ESP_VIDEO_ENABLE_HW_H264_VIDEO_DEVICE=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# esp_hosted is pulled in by the esp_wifi_remote dependency, and its host init is a
+# global constructor that grabs ~39 KB of internal DMA RAM before app_main. Ethernet
+# builds do not need it. APP_NETIF_WIFI selects it back on.
+# CONFIG_ESP_HOSTED_ENABLED is not set
+
 # WebRTC (libpeer): DTLS-SRTP + PSRAM-backed mbedtls allocations
 CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
 CONFIG_MBEDTLS_SSL_DTLS_SRTP=y
