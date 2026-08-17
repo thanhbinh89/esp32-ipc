@@ -75,8 +75,8 @@ Notes:
 
 - **I2C0 is shared** between the camera SCCB bus and the ES8311 control bus (both
   SCL=8, SDA=7). `esp_video_init()` creates the bus (`init_sccb = true`);
-  `app_audio_init()` then calls `i2c_master_get_bus_handle()` to join it. This is why
-  `app_video_init()` must run before `app_audio_init()` in `app_main`.
+  `hal_audio_init()` then calls `i2c_master_get_bus_handle()` to join it. This is why
+  `hal_video_init()` must run before `hal_audio_init()` in `app_main`.
 - **Networking is a compile-time choice** (`CONFIG_APP_NETIF_ETH` vs
   `CONFIG_APP_NETIF_WIFI`), not a runtime one. Current `sdkconfig` selects Ethernet.
 - Wi-Fi goes through `esp_wifi_remote` / `esp_hosted` on a companion chip, since the
@@ -86,125 +86,142 @@ Notes:
 
 ## 3. Software layer diagram
 
+`main/` is split into three layers. Nothing in `hal/` knows application policy,
+nothing in `core/` owns a FreeRTOS task, and each file in `task/` owns exactly one.
+
 ```mermaid
 graph TD
-    subgraph APP["Application (main/)"]
-        MAIN["app_main.cpp<br/>boot, netif, task launch"]
-        VT["video_task.cpp<br/>V4L2 capture + H.264 encode"]
-        PDT["pedestrian_detect_task.cpp<br/>inference + box store + OSD apply"]
-        AT["task_audio.cpp<br/>PCM read + G.711-A encode"]
-        ST["task_speaker.cpp<br/>PCM playback (not started)"]
-        WT["task_webrtc.cpp<br/>PeerConnection + signaling"]
-        OSD["osd.c<br/>YUV420 rect draw"]
-        PIPE["app_camera_pipeline.cpp<br/>lock-free buffer ring"]
-        AV["app_video.c<br/>esp_video_init wrapper"]
-        AA["app_audio.c<br/>I2S + ES8311 bring-up"]
-        AE["app_ethernet.c<br/>EMAC + IP101"]
-        DEF["app_define.h<br/>stack sizes"]
+    subgraph TASK["task/ - one FreeRTOS task each"]
+        TV["task_video.cpp<br/>capture + encode orchestration, 1 Hz stats"]
+        TD["task_detect.cpp<br/>inference loop, box store"]
+        TA["task_audio.cpp<br/>PCM read + G.711-A encode"]
+        TW["task_webrtc.cpp<br/>PeerConnection + signaling"]
     end
 
-    subgraph LOCAL["Local component (components/)"]
-        PD["pedestrian_detect<br/>Pico s8 v1 wrapper"]
+    subgraph CORE["core/ - app services, no tasks"]
+        WAPI["webrtc_api.h<br/>send video/audio, keyframe request"]
+        DET["detector.h<br/>detector_iface_t - the swap point"]
+        OSD["osd.c<br/>YUV420 box rasteriser + dirty span"]
+        POOL["frame_pool.cpp<br/>zero-copy producer/consumer buffers"]
     end
 
-    subgraph MANAGED["Managed components"]
-        ESPVIDEO["espressif/esp_video<br/>V4L2 devices"]
-        ESPDL["espressif/esp-dl<br/>quantised NN runtime"]
-        CODECDEV["espressif/esp_codec_dev"]
-        LIBPEER["sepfy/libpeer + srtp + usrsctp"]
-        WIFIREMOTE["espressif/esp_wifi_remote<br/>esp_hosted"]
+    subgraph HAL["hal/ - thin wrappers, no policy, no globals"]
+        HVC["hal_video_capture.c<br/>V4L2 MIPI-CSI"]
+        HENC["hal_h264_encoder.c<br/>V4L2 m2m encoder"]
+        HPPA["hal_ppa.c<br/>YUV420 -> RGB565 + exact-scale guard"]
+        HAUD["hal_audio.c<br/>I2S + ES8311"]
+        HNET["hal_netif.c<br/>Ethernet or Wi-Fi, waits for IP"]
+        HVI["hal_video_init.c<br/>esp_video_init + shared I2C bus"]
     end
 
-    subgraph IDF["ESP-IDF v5.5.4"]
-        V4L2["V4L2 shim (open/ioctl/mmap)"]
-        PPAD["esp_driver_ppa"]
-        I2SD["esp_driver_i2s"]
-        I2CD["esp_driver_i2c"]
-        MM["esp_mm / esp_cache"]
-        NETIF["esp_netif + lwIP + mbedTLS"]
-        RTOS["FreeRTOS SMP"]
+    MAIN["app_main.cpp<br/>boot only"]
+    CFG["app_config.h<br/>every tunable"]
+
+    subgraph EXT["Components"]
+        PD["components/pedestrian_detect<br/>Pico s8 v1 wrapper"]
+        ESPVIDEO["esp_video - V4L2 devices"]
+        ESPDL["esp-dl - quantised NN runtime"]
+        CODECDEV["esp_codec_dev"]
+        LIBPEER["libpeer + srtp + usrsctp"]
+        IDF["ESP-IDF: PPA, I2S, I2C, esp_cache, lwIP, FreeRTOS"]
     end
 
-    MAIN --> AV & AA & AE & VT & PDT & AT & WT
-    VT --> OSD & PIPE & V4L2 & PPAD
-    VT --> WT
-    PDT --> PD & PIPE & OSD
+    MAIN --> HNET & HVI & HAUD & TV & TA & TW
+    TV --> HVC & HENC & HPPA & DET & OSD & WAPI
+    TD --> POOL & DET & PD
+    TA --> HAUD & WAPI
+    TW --> WAPI & LIBPEER
+    TD -. "implements" .-> DET
+    OSD --> DET
     PD --> ESPDL
-    AT --> AA & WT
-    ST --> AA
-    AA --> CODECDEV & I2SD & I2CD
-    AV --> ESPVIDEO
-    ESPVIDEO --> V4L2
-    AE --> NETIF
-    WT --> LIBPEER
-    LIBPEER --> NETIF
-    VT --> MM
-    NETIF --> RTOS
+    HAUD --> CODECDEV
+    HVI --> ESPVIDEO
+    HVC & HENC --> ESPVIDEO
+    HNET & LIBPEER --> IDF
+    HPPA --> IDF
+    CFG -.-> TASK & CORE & HAL
 ```
+
+The two edges that matter most are the ones that are *absent*: `task_video` has no
+route to libpeer except through `webrtc_api`, and no route to the detector except
+through `detector_iface_t`.
 
 ### File responsibilities
 
-| File                                                              | Responsibility                                                                                                      |
-| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| [main/app_main.cpp](main/app_main.cpp)                             | Boot order, netif bring-up, blocks on`GOT_IP_BIT`, creates top-level tasks                                        |
-| [main/app_video.c](main/app_video.c)                               | Idempotent`esp_video_init()` with SCCB pin config; creates the shared I2C bus                                     |
-| [main/video_task.cpp](main/video_task.cpp)                         | V4L2 device setup, capture + encode sub-tasks, PPA feed, WebRTC video send, 1 s stats                               |
-| [main/video_task.h](main/video_task.h)                             | `CAM_WIDTH/HEIGHT`, `CAP_BUF_COUNT`, `VIDEO_QUEUE_LEN`, H.264 rate-control constants                          |
-| [main/pedestrian_detect_task.cpp](main/pedestrian_detect_task.cpp) | Detector instance, inference loop on core 1, mutex-protected box store, OSD application                             |
-| [main/app_camera_pipeline.cpp](main/app_camera_pipeline.cpp)       | Two-list (`queued`/`done`) buffer ring with a counting semaphore; the producer/consumer handoff to the detector |
-| [main/osd.c](main/osd.c)                                           | Rectangle rasteriser for packed`O_UYY_E_VYY` YUV420                                                               |
-| [main/app_audio.c](main/app_audio.c)                               | I2S std-mode channels, ES8311 codec object, volume / mic gain                                                       |
-| [main/task_audio.cpp](main/task_audio.cpp)                         | 20 ms PCM reads, linear16 -> G.711-A, WebRTC audio send                                                             |
-| [main/task_speaker.cpp](main/task_speaker.cpp)                     | Loops an embedded`canon.pcm` to the speaker — **compiled but never started**                               |
-| [main/task_webrtc.cpp](main/task_webrtc.cpp)                       | `PeerConnection` lifecycle, ICE callbacks, keyframe-request flag, signaling + PC poll loops                       |
-| [main/app_ethernet.c](main/app_ethernet.c)                         | ESP32 EMAC + IP101 PHY driver install                                                                               |
-| [components/pedestrian_detect](components/pedestrian_detect)       | `PedestrianDetect` wrapper: Pico s8 v1 model, preprocessor, `PicoPostprocessor`                                 |
+| File | Responsibility |
+| --- | --- |
+| [main/app_main.cpp](main/app_main.cpp) | Boot only: network up, video + audio init, spawn tasks, return |
+| [main/app_config.h](main/app_config.h) | Every tunable: resolutions, rate control, stacks, priorities, cores |
+| **hal/** | |
+| [hal_video_capture.c](main/hal/hal_video_capture.c) | V4L2 MIPI-CSI: format, buffer mapping, acquire/release, and publishing CPU edits to DMA readers |
+| [hal_h264_encoder.c](main/hal/hal_h264_encoder.c) | V4L2 m2m: rate control, encode one frame, force IDR |
+| [hal_ppa.c](main/hal/hal_ppa.c) | YUV420 -> RGB565 downscale + `HAL_PPA_SCALE_IS_EXACT` guard |
+| [hal_audio.c](main/hal/hal_audio.c) | I2S std-mode channels, ES8311 codec, volume / mic gain |
+| [hal_netif.c](main/hal/hal_netif.c) | Ethernet or Wi-Fi bring-up behind one call that blocks until DHCP |
+| [hal_video_init.c](main/hal/hal_video_init.c) | `esp_video_init()` with SCCB pins; creates the shared I2C bus |
+| **core/** | |
+| [webrtc_api.h](main/core/webrtc_api.h) | The only route to the PeerConnection; owns the gate-and-lock policy |
+| [detector.h](main/core/detector.h) | `detector_iface_t`: acquire/submit/discard input, read boxes back |
+| [osd.c](main/core/osd.c) | Corner-mark rasteriser for packed `O_UYY_E_VYY`; reports the row bands it dirtied, and knows nothing about cache |
+| [frame_pool.cpp](main/core/frame_pool.cpp) | Free/ready lists + counting semaphore for zero-copy handoff |
+| [libpeer_config.h](main/core/libpeer_config.h) | The libpeer settings the app must agree with; force-included into that component |
+| **task/** | |
+| [task_video.cpp](main/task/task_video.cpp) | Capture + encode sub-tasks, detector feed, OSD, send, 1 Hz stats |
+| [task_detect.cpp](main/task/task_detect.cpp) | Inference on core 1, box store; implements `detector_pedestrian` |
+| [task_audio.cpp](main/task/task_audio.cpp) | 20 ms PCM reads, linear16 -> G.711-A, send |
+| [task_webrtc.cpp](main/task/task_webrtc.cpp) | PeerConnection lifecycle, ICE callbacks, signaling + PC poll loops |
+| [components/pedestrian_detect](components/pedestrian_detect) | `PedestrianDetect`: Pico s8 v1 model, preprocessor, `PicoPostprocessor` |
 
 ---
 
 ## 4. Task model
 
 Every task except the detector is pinned to **core 0**. Core 1 runs only ESP-DL
-inference, which is what keeps the ~51 ms Pico inference from stalling the encoder.
+inference, which is what keeps the ~100 ms Pico inference from stalling the encoder.
 
-| Task name     | Entry point              | Core | Prio | Stack | Created by                                                            |
-| ------------- | ------------------------ | ---- | ---- | ----- | --------------------------------------------------------------------- |
-| `main`      | `app_main`             | 0    | 1    | 3584  | IDF startup                                                           |
-| `audio`     | `task_audio`           | 0    | 4    | 4096  | [app_main.cpp:172](main/app_main.cpp#L172)                             |
-| `camera`    | `video_task`           | 0    | 5    | 4096  | [app_main.cpp:179](main/app_main.cpp#L179)                             |
-| `webrtc`    | `task_webrtc`          | 0    | 6    | 4096  | [app_main.cpp:183](main/app_main.cpp#L183)                             |
-| `video_cap` | `video_capture_task`   | 0    | 5    | 4096  | [video_task.cpp:387](main/video_task.cpp#L387)                         |
-| `video_enc` | `video_encode_task`    | 0    | 5    | 4096  | [video_task.cpp:391](main/video_task.cpp#L391)                         |
-| `peer`      | `peer_connection_task` | 0    | 5    | 8192  | [task_webrtc.cpp:102](main/task_webrtc.cpp#L102)                       |
-| `detect`    | `detect_task`          | 1    | 7    | 8192  | [pedestrian_detect_task.cpp:105](main/pedestrian_detect_task.cpp#L105) |
+Priorities follow how hard each deadline is. Audio outranks video because it must
+call `esp_codec_dev_read()` every 20 ms or the I2S RX ring overruns, whereas a late
+video frame only costs a frame. The 1 ms `peer` loop outranks the 10 ms signaling
+poll. All of it is declared in [app_config.h](main/app_config.h).
 
-After spawning the sub-tasks, `video_task` itself degenerates into a 1 Hz statistics
-printer, and `app_main` into a 5 s idle loop.
+| Task name | Entry point | Core | Prio | Stack | Created by |
+| --- | --- | --- | --- | --- | --- |
+| `main` | `app_main` | 0 | 1 | 3584 | IDF startup (returns once tasks are up) |
+| `detect` | `detect_task` | 1 | 7 | 8192 | `detector_pedestrian.start()` |
+| `audio` | `task_audio` | 0 | 6 | 4096 | [app_main.cpp](main/app_main.cpp) |
+| `peer` | `peer_connection_task` | 0 | 6 | 8192 | [task_webrtc.cpp](main/task/task_webrtc.cpp) |
+| `video_cap` | `video_capture_task` | 0 | 5 | 4096 | [task_video.cpp](main/task/task_video.cpp) |
+| `video_enc` | `video_encode_task` | 0 | 5 | 4096 | [task_video.cpp](main/task/task_video.cpp) |
+| `camera` | `task_video` | 0 | 5 -> 1 | 4096 | [app_main.cpp](main/app_main.cpp) |
+| `webrtc` | `task_webrtc` | 0 | 3 | 4096 | [app_main.cpp](main/app_main.cpp) |
+
+`camera` runs at 5 while it opens the V4L2 devices, then calls `vTaskPrioritySet()`
+to drop itself to 1 — from that point it only prints statistics once a second and
+must not outrank the tasks doing the work.
 
 ### Task interaction graph
 
 ```mermaid
 graph LR
-    CAP["video_cap"] -- "cap_queue<br/>(FreeRTOS queue, len 2)" --> ENC["video_enc"]
-    ENC -- "feed pipeline<br/>(2 RGB565 elements)" --> DET["detect"]
-    DET -- "s_boxes + s_box_mutex" --> ENC
-    ENC -- "peer_connection_send_video()<br/>under g_pc_lock" --> PEER["peer"]
-    AUD["audio"] -- "peer_connection_send_audio()<br/>under g_pc_lock" --> PEER
+    CAP["video_cap"] -- "cap_queue<br/>descriptors only, len 2" --> ENC["video_enc"]
+    ENC -- "detector_iface_t<br/>acquire / submit" --> DET["detect"]
+    DET -- "get_boxes()" --> ENC
+    ENC -- "webrtc_send_video()" --> PEER["peer"]
+    AUD["audio"] -- "webrtc_send_audio()" --> PEER
     WRTC["webrtc"] -- "peer_signaling_loop()" --> PEER
-    PEER -- "on_request_keyframe -><br/>s_keyframe_requested" --> ENC
+    PEER -- "webrtc_take_keyframe_request()" --> ENC
     VT["camera (stats)"] -. "reads s_ctx counters" .-> ENC
 ```
 
 ### Shared state
 
-| Symbol                        | Owner                         | Readers                                                      | Protection                                       |
-| ----------------------------- | ----------------------------- | ------------------------------------------------------------ | ------------------------------------------------ |
-| `g_pc`, `eState`          | `webrtc`                    | `video_enc`, `audio`                                     | plain reads;`eState` written from ICE callback |
-| `g_pc_lock`                 | `webrtc`                    | `video_enc` (2 ms timeout), `audio` (infinite), `peer` | FreeRTOS mutex                                   |
-| `s_keyframe_requested`      | libpeer callback              | `video_enc`                                                | `volatile bool`, read-and-clear                |
-| `s_boxes` / `s_box_count` | `detect`                    | `video_enc` (via `pedestrian_detect_overlay_last_boxes`) | `s_box_mutex`                                  |
-| feed pipeline lists           | shared                        | `video_enc` (producer), `detect` (consumer)              | `portMUX_TYPE` spinlock + counting semaphore   |
-| `s_ctx` stats               | `video_cap` / `video_enc` | `camera`                                                   | none (non-atomic counters, stats only)           |
+| Symbol | Owner | Readers | Protection |
+| --- | --- | --- | --- |
+| `s_pc`, `s_state`, `s_pc_lock` | `task_webrtc.cpp` | none — private; reached only via `webrtc_send_*()` | FreeRTOS mutex, taken inside the API |
+| `s_keyframe_requested` | libpeer callback | `video_enc` via `webrtc_take_keyframe_request()` | `volatile bool`, read-and-clear |
+| `s_boxes` / `s_box_count` | `detect` | `video_enc` via `get_boxes()` | `s_box_mutex` |
+| frame pool lists | shared | `video_enc` (producer), `detect` (consumer) | `portMUX_TYPE` spinlock + counting semaphore |
+| `s_ctx` stats | `video_cap` / `video_enc` | `camera` | none (non-atomic counters, stats only) |
 
 ---
 
@@ -241,109 +258,91 @@ sequenceDiagram
     autonumber
     participant IDF as IDF startup
     participant M as app_main
-    participant ETH as EMAC/IP101
+    participant NET as hal_netif
     participant EV as esp_event loop
-    participant AV as app_video
-    participant AA as app_audio
+    participant AV as hal_video_init
+    participant AA as hal_audio
     participant T as spawned tasks
 
     IDF->>M: app_main()
-    M->>M: xEventGroupCreate() -> s_net_event_group
-    M->>M: esp_netif_init(), esp_event_loop_create_default()
+    M->>NET: hal_netif_start_and_wait_ip()
+    NET->>NET: esp_netif_init(), esp_event_loop_create_default()
 
     alt CONFIG_APP_NETIF_ETH (current sdkconfig)
-        M->>ETH: app_eth_init() - esp_eth_mac_new_esp32 + esp_eth_phy_new_ip101
-        M->>M: esp_netif_new(ESP_NETIF_DEFAULT_ETH) + esp_eth_new_netif_glue + attach
-        M->>EV: register eth_event_handler(ETH_EVENT), got_ip_event_handler(IP_EVENT_ETH_GOT_IP)
-        M->>ETH: esp_eth_start()
-        ETH-->>EV: ETHERNET_EVENT_START / _CONNECTED
+        NET->>NET: esp_eth_mac_new_esp32 + esp_eth_phy_new_ip101 + driver install
+        NET->>NET: esp_netif_new(ESP_NETIF_DEFAULT_ETH) + netif glue + attach
+        NET->>EV: register on_eth_event, on_got_ip(IP_EVENT_ETH_GOT_IP)
+        NET->>NET: esp_eth_start()
     else CONFIG_APP_NETIF_WIFI
-        M->>M: esp_netif_create_default_wifi_sta() + esp_wifi_init()
-        M->>EV: register wifi_event_handler, got_ip_event_handler(IP_EVENT_STA_GOT_IP)
-        M->>M: esp_wifi_set_config(STA, ssid/pass, WPA2_WPA3_PSK) + esp_wifi_start()
-        EV-->>M: WIFI_EVENT_STA_START -> esp_wifi_connect()
+        NET->>NET: esp_netif_create_default_wifi_sta() + esp_wifi_init()
+        NET->>EV: register on_wifi_event, on_got_ip(IP_EVENT_STA_GOT_IP)
+        NET->>NET: set STA config (WPA2/WPA3) + esp_wifi_start()
+        EV-->>NET: WIFI_EVENT_STA_START -> esp_wifi_connect()
     end
 
-    Note over M: xEventGroupWaitBits(GOT_IP_BIT, portMAX_DELAY) - blocks here
-    EV-->>M: IP_EVENT_*_GOT_IP -> got_ip_event_handler -> set GOT_IP_BIT
-    M->>M: unblocked
+    Note over NET: blocks in xEventGroupWaitBits(GOT_IP_BIT)
+    EV-->>NET: IP_EVENT_*_GOT_IP -> on_got_ip -> set GOT_IP_BIT
+    NET-->>M: ESP_OK
 
-    M->>AV: app_video_init()
+    M->>AV: hal_video_init()
     AV->>AV: esp_video_init(csi cfg) - creates shared I2C0 bus, probes OV5647
-    Note right of AV: registers /dev/video0 (CSI), ISP and H.264 m2m devices
+    Note right of AV: registers the CSI, ISP and H.264 m2m V4L2 devices
 
-    M->>AA: app_audio_init()
+    M->>AA: hal_audio_init()
     AA->>AA: i2c_master_get_bus_handle(I2C0) - joins the bus esp_video created
     AA->>AA: i2s_new_channel + init_std_mode(16-bit mono @8k) + enable tx/rx
-    AA->>AA: es8311_codec_new + esp_codec_dev_open + set_out_vol(70) + set_in_gain(30 dB)
+    AA->>AA: es8311_codec_new + esp_codec_dev_open + volume + mic gain
     alt init OK
-        M->>T: xTaskCreatePinnedToCore(task_audio, "audio", 4096, prio 4, core 0)
+        M->>T: create "audio" (prio 6, core 0)
     else init failed
         M->>M: log "running without audio", continue
     end
 
-    M->>T: xTaskCreatePinnedToCore(video_task, "camera", 4096, arg=s_feed_pipeline, prio 5, core 0)
-    M->>T: xTaskCreatePinnedToCore(task_webrtc, "webrtc", 4096, prio 6, core 0)
-
-    alt CONFIG_APP_ENABLE_AI
-        M->>M: camera_element_pipeline_new(2 x 640*360*2 B, 128-B aligned, SPIRAM)
-        M->>T: pedestrian_detect_task_start(&s_feed_pipeline) -> "detect" prio 7, core 1
-    end
-
-    loop forever
-        M->>M: vTaskDelay(5000 ms)
-    end
+    M->>T: create "camera" -> task_video (prio 5, core 0)
+    M->>T: create "webrtc" -> task_webrtc (prio 3, core 0)
+    Note over M: returns - the main task ends and its stack is freed
 ```
 
-> **Ordering defect.** `video_task` is handed `s_feed_pipeline` at
-> [app_main.cpp:179](main/app_main.cpp#L179), but the pipeline is only allocated at
-> [app_main.cpp:194](main/app_main.cpp#L194). The camera task therefore captures a
-> `NULL` handle, and `convert_to_rgb_for_detector()` returns immediately at its
-> `if (!feed)` guard — the detector never receives a frame. Moving the
-> `camera_element_pipeline_new()` block above the `video_task` creation fixes it.
-
-### 5.2 `video_task` internal init
+### 5.2 `task_video` internal init
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant VT as video_task
+    participant TV as task_video
     participant PPA as esp_driver_ppa
-    participant CAP as /dev/video (MIPI-CSI)
-    participant ENC as /dev/video (H.264 m2m)
+    participant CAP as hal_video_capture
+    participant ENC as hal_h264_encoder
+    participant DET as detector_pedestrian
     participant SUB as sub-tasks
 
-    VT->>PPA: ppa_register_client(PPA_OPERATION_SRM)
-    VT->>VT: app_video_init() (idempotent no-op, already done in app_main)
+    TV->>PPA: ppa_register_client(PPA_OPERATION_SRM)
+    TV->>TV: hal_video_init() (idempotent no-op, already done in app_main)
 
-    rect rgb(240,244,250)
-        Note over VT,CAP: capture_fd_init()
-        VT->>CAP: open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDONLY)
-        VT->>CAP: VIDIOC_S_FMT 1920x1080 V4L2_PIX_FMT_YUV420
-        VT->>CAP: VIDIOC_REQBUFS count=3 MMAP
-        loop i = 0..2
-            VT->>CAP: VIDIOC_QUERYBUF(i) -> mmap() -> cap_mmap[i]
-            VT->>CAP: VIDIOC_QBUF(i)
-        end
-    end
+    TV->>CAP: hal_vcap_open(1920x1080)
+    CAP->>CAP: open device, S_FMT YUV420, REQBUFS 3 MMAP
+    CAP->>CAP: QUERYBUF + mmap + QBUF each buffer
 
-    rect rgb(245,240,250)
-        Note over VT,ENC: encode_fd_init()
-        VT->>ENC: open(ESP_VIDEO_H264_DEVICE_NAME, O_RDONLY)
-        VT->>ENC: S_EXT_CTRLS I_PERIOD=5, BITRATE=1000000, MIN_QP=35, MAX_QP=45
-        VT->>ENC: VIDIOC_S_FMT OUTPUT 1920x1080 YUV420 + REQBUFS count=1 USERPTR
-        VT->>ENC: VIDIOC_S_FMT CAPTURE 1920x1080 H264 + REQBUFS count=1 MMAP
-    end
+    TV->>ENC: hal_h264_open(I period 60, 1 Mbps, QP 22-38)
+    ENC->>ENC: S_EXT_CTRLS rate control
+    ENC->>ENC: S_FMT OUTPUT YUV420 + REQBUFS 1 USERPTR
+    ENC->>ENC: S_FMT CAPTURE H264 + REQBUFS 2 MMAP, mmap + QBUF each
 
-    VT->>ENC: VIDIOC_QUERYBUF(CAPTURE,0) -> mmap() -> enc_out_mmap -> VIDIOC_QBUF
-    VT->>ENC: VIDIOC_STREAMON(CAPTURE), VIDIOC_STREAMON(OUTPUT)
-    VT->>CAP: VIDIOC_STREAMON(CAPTURE)
-    VT->>VT: xQueueCreate(VIDEO_QUEUE_LEN=2, sizeof(video_cap_item_t))
-    VT->>SUB: create "video_cap" (prio 5, core 0)
-    VT->>SUB: create "video_enc" (prio 5, core 0)
+    TV->>ENC: hal_h264_start() - STREAMON both queues
+    TV->>CAP: hal_vcap_start() - STREAMON
+    TV->>TV: xQueueCreate(VIDEO_QUEUE_LEN, sizeof(hal_vcap_frame_t))
+
+    TV->>DET: start()
+    DET->>DET: frame_pool_new(2 x 480x270x2 B, 128-B aligned, SPIRAM)
+    DET->>DET: new PedestrianDetect() - loads the esp-dl model here, not statically
+    DET->>SUB: create "detect" (prio 7, core 1)
+    Note over TV: a failure here is logged, not fatal - video keeps streaming
+
+    TV->>SUB: create "video_cap" (prio 5, core 0)
+    TV->>SUB: create "video_enc" (prio 5, core 0)
+    TV->>TV: vTaskPrioritySet(NULL, TASK_PRIO_STATS) - drop to 1
 
     loop every 1 s
-        VT->>VT: log cap / cap_drop / enc / send_ok / send_fail / bitrate / queue depth, then reset
+        TV->>TV: log cap / cap_drop / enc / send_ok / send_fail / bitrate / queue depth, then reset
     end
 ```
 
@@ -449,18 +448,22 @@ menus, plus the model options in
 | *(esp_hosted)*            | `ESP_HOSTED_ENABLED` — forced off in `sdkconfig.defaults`, see §5.0     | `n` (Ethernet build)                               |
 | models: pedestrian_detect | `PEDESTRIAN_DETECT_PICO_S8_V1`, model location                         | `y`, flash rodata                                  |
 
-Compile-time constants that are **not** Kconfig options:
+Everything that is **not** a Kconfig option now lives in one file,
+[main/app_config.h](main/app_config.h): frame and detector resolutions, H.264 rate
+control, OSD colour, audio packet size, WebRTC lock timeouts, and every task stack,
+priority and core assignment. Notable current values:
 
-| Constant                                                  | File                                                                 | Value                     |
-| --------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------- |
-| `CAM_WIDTH` / `CAM_HEIGHT`                            | [video_task.h](main/video_task.h#L7-L8)                               | 1920 / 1080               |
-| `CAP_BUF_COUNT`                                         | [video_task.h](main/video_task.h#L9)                                  | 3                         |
-| `VIDEO_QUEUE_LEN`                                       | [video_task.h](main/video_task.h#L10)                                 | 2                         |
-| `H264_I_PERIOD` / `BITRATE` / `MIN_QP` / `MAX_QP` | [video_task.h](main/video_task.h#L12-L15)                             | 5 / 1000000 / 35 / 45     |
-| `PED_DETECT_WIDTH` / `_HEIGHT` / `_MAX_BOX`         | [pedestrian_detect_task.h](main/pedestrian_detect_task.h#L7-L9)       | 640 / 360 / 10            |
-| `OSD_Y/U/V`, `OSD_THICKNESS`                          | [pedestrian_detect_task.cpp](main/pedestrian_detect_task.cpp#L21-L24) | 76/84/255, 4 px (red)     |
-| `AUDIO_READ_BYTES`                                      | [task_audio.cpp](main/task_audio.cpp#L13)                             | 320 (20 ms @ 8 kHz int16) |
-| `TASK_*_STACK_SIZE`                                     | [app_define.h](main/app_define.h)                                     | 4096 each                 |
+| Constant | Value | Note |
+| --- | --- | --- |
+| `CAM_WIDTH` / `CAM_HEIGHT` | 1920 / 1080 | |
+| `CAP_BUF_COUNT` / `VIDEO_QUEUE_LEN` | 3 / 2 | queue depth derives from the buffer count |
+| `ENC_OUT_BUF_COUNT` | 2 | lets encode overlap the RTP send |
+| `H264_I_PERIOD` / `BITRATE` / `MIN_QP` / `MAX_QP` | 60 / 1000000 / 22 / 38 | long GOP, PLI-driven IDR |
+| `DET_WIDTH` / `DET_HEIGHT` / `DET_MAX_BOX` | 480 / 270 / 10 | exactly 4/16 of the frame |
+| `DET_FEED_ELEMENTS` / `DET_TIMING_WINDOW` | 2 / 16 | |
+| `OSD_Y/U/V`, `OSD_THICKNESS` | 76/84/255, 4 px | red |
+| `AUDIO_READ_BYTES` | 320 | 20 ms @ 8 kHz int16 |
+| `WEBRTC_VIDEO_LOCK_MS` / `_AUDIO_LOCK_MS` | 2 / 20 | video drops, audio waits |
 
 ---
 
@@ -486,7 +489,7 @@ via `EMBED_FILES`.
 | ------------------------- | --------------------------------------- | -------------------- | ---------------------------- |
 | 3x capture buffers        | V4L2 mmap (driver-allocated)            | 3 x ~3.1 MB          | 1920x1080x1.5 packed YUV420  |
 | 1x H.264 bitstream buffer | V4L2 mmap                               | driver-sized         | single output slot           |
-| 2x detector feed buffers  | `MALLOC_CAP_SPIRAM`, 128-B aligned    | 2 x 450 KB           | 640x360x2 RGB565             |
+| 2x detector feed buffers  | `MALLOC_CAP_SPIRAM`, 128-B aligned    | 2 x 253 KB           | 480x270x2 RGB565             |
 | ESP-DL model working set  | internal + PSRAM                        | model-dependent      | only when`APP_ENABLE_AI=y` |
 | libpeer ring buffers      | patched to`MALLOC_CAP_SPIRAM`         | audio / video / data | see §9                      |
 | mbedTLS heap              | `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` | PSRAM                | keeps DTLS off internal RAM  |
@@ -540,14 +543,15 @@ libpeer/srtp/usrsctp component CMake files, and sets `MINIMAL_BUILD ON`.
 
 ## 10. Known gaps
 
-Open issues, recorded as-is.
+Every item previously listed here has been closed. What remains is not a defect but
+an unverified opportunity:
 
-| # | Issue | Location |
-| - | --- | --- |
-| 1 | `s_feed_pipeline` is passed to `video_task` before it is allocated -> detector feed is always `NULL` | [app_main.cpp:179](main/app_main.cpp#L179) vs [:194](main/app_main.cpp#L194) |
-| 2 | On `cap_queue` overflow the capture buffer is dropped **without** `VIDIOC_QBUF` — the re-queue is commented out, so the camera permanently loses that buffer | [video_task.cpp:153-157](main/video_task.cpp#L153-L157) |
-| 3 | `task_speaker` and its 625 KB embedded `canon.pcm` are compiled and linked but the task is never created | [task_speaker.cpp](main/task_speaker.cpp), [CMakeLists.txt](main/CMakeLists.txt#L9) |
-| 4 | `video_encode_task` logs `"video_capture_task started"` | [video_task.cpp:169](main/video_task.cpp#L169) |
-| 5 | `audio` takes `g_pc_lock` with `portMAX_DELAY` while `video_enc` uses a 2 ms timeout — the audio task can block behind `peer_connection_loop()` | [task_audio.cpp:81](main/task_audio.cpp#L81) |
-| 6 | The doc comment in `video_task.h` still claims "~15 fps pacing"; no pacing code exists | [video_task.h:17-20](main/video_task.h#L17-L20) |
-| 7 | `pedestrian_detect_overlay_last_boxes()` is declared unconditionally but has no stub in the `APP_ENABLE_AI=n` branch — harmless only because its one call site is itself guarded | [pedestrian_detect_task.h:30](main/pedestrian_detect_task.h#L30) vs [video_task.cpp:205](main/video_task.cpp#L205) |
+| # | Item | Where |
+| --- | --- | --- |
+| 1 | **On-demand IDR is impossible with this driver.** esp_video's H.264 device implements only four ext-controls (I_PERIOD, BITRATE, MIN_QP, MAX_QP) and rejects `FORCE_KEY_FRAME`; it also reads `gop` only when it builds the encoder at STREAMON, so I_PERIOD cannot be nudged at runtime either. A joining browser waits up to one GOP for its first decodable frame. | [esp_video_h264_device.c:360](managed_components/espressif__esp_video/src/device/esp_video_h264_device.c#L360) |
+| 2 | **`I_PERIOD` doubles as the assumed frame rate** (`.gop = gop, .fps = gop`), so it also sets how the rate controller divides the bitrate across a second. `H264_TARGET_FPS` must track the rate the pipeline actually sustains — a mismatch either starves or overshoots every frame. | [esp_video_h264_device.c:202](managed_components/espressif__esp_video/src/device/esp_video_h264_device.c#L202) |
+| 3 | **The PPA driver flushes its whole input window per call** — 3,110,400 bytes for a 1080p source — which is most of the measured 85 ms and is not avoidable through its public API. `DET_FEED_EVERY_N` exists to amortise it. | [DATAFLOW.md §7](DATAFLOW.md#7-rates-and-timing-budget) |
+| 4 | `DL_IMAGE_CAP_PPA` is not set on the esp-dl `ImagePreprocessor`, so its resize to the model's 224x224 input runs in software. Enabling it is not a free win: the same 1/16 scale quantisation described in §7 applies to that second resize, and esp-dl's own guard against it is ineffective (`err_pct` is computed from the *unquantised* scale, so it is always ~0). Measure with the `inference avg` log before keeping it. | [pedestrian_detect.cpp:23](components/pedestrian_detect/pedestrian_detect.cpp#L23) |
+| 5 | Stack sizes are uniform 4096/8192 rather than measured. Add `uxTaskGetStackHighWaterMark()` to the stats line while tuning, then size them in `app_config.h`. | [app_config.h](main/app_config.h) |
+| 6 | Browser -> device audio is unwired: the codec is opened `ESP_CODEC_DEV_WORK_MODE_BOTH` and I2S TX is enabled, but no inbound audio-track callback is registered. | [task_webrtc.cpp](main/task/task_webrtc.cpp) |
+| 7 | Stats counters are incremented from `video_cap`/`video_enc` and reset from `camera` without synchronisation. Harmless for diagnostics; the numbers can be off by one. | [task_video.cpp](main/task/task_video.cpp) |

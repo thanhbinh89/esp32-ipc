@@ -1,4 +1,4 @@
-#include "app_audio.h"
+#include "hal_audio.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -22,7 +22,7 @@
 #define APP_AUDIO_VOLUME          CONFIG_APP_AUDIO_VOLUME
 #define APP_AUDIO_MIC_GAIN_DB     CONFIG_APP_AUDIO_MIC_GAIN_DB
 
-static const char *TAG = "app_audio";
+static const char *TAG = "hal_audio";
 
 static esp_codec_dev_handle_t s_codec;
 static const audio_codec_data_if_t *s_i2s_data_if;
@@ -72,7 +72,7 @@ static esp_err_t audio_i2s_init(void) {
     return ESP_OK;
 }
 
-esp_err_t app_audio_init(void) {
+esp_err_t hal_audio_init(void) {
     if (s_codec) {
         return ESP_OK;
     }
@@ -139,6 +139,6 @@ esp_err_t app_audio_init(void) {
     return ESP_OK;
 }
 
-esp_codec_dev_handle_t app_audio_get_handle(void) {
+esp_codec_dev_handle_t hal_audio_get_handle(void) {
     return s_codec;
 }

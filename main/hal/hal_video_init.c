@@ -1,9 +1,8 @@
 #include "sdkconfig.h"
-#include "app_video.h"
+#include "hal_video_init.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_video_init.h"
-#include "pedestrian_detect_task.h"
 
 #define APP_MIPI_CSI_SCCB_I2C_PORT    CONFIG_APP_MIPI_CSI_SCCB_I2C_PORT
 #define APP_MIPI_CSI_SCCB_I2C_SCL_PIN CONFIG_APP_MIPI_CSI_SCCB_I2C_SCL_PIN
@@ -12,7 +11,7 @@
 #define APP_MIPI_CSI_SENSOR_RESET_PIN CONFIG_APP_MIPI_CSI_SENSOR_RESET_PIN
 #define APP_MIPI_CSI_SENSOR_PWDN_PIN  CONFIG_APP_MIPI_CSI_SENSOR_PWDN_PIN
 
-static const char *TAG = "app_video";
+static const char *TAG = "hal_video";
 static bool s_is_init;
 
 static const esp_video_init_csi_config_t s_csi_config = {
@@ -33,7 +32,7 @@ static const esp_video_init_config_t s_video_config = {
     .csi = &s_csi_config,
 };
 
-esp_err_t app_video_init(void) {
+esp_err_t hal_video_init(void) {
     if (s_is_init) {
         return ESP_OK;
     }

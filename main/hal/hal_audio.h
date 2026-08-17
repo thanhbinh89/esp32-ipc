@@ -7,8 +7,8 @@
 extern "C" {
 #endif
 
-esp_err_t app_audio_init(void);
-esp_codec_dev_handle_t app_audio_get_handle(void);
+esp_err_t hal_audio_init(void);
+esp_codec_dev_handle_t hal_audio_get_handle(void);
 
 #ifdef __cplusplus
 }

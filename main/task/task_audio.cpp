@@ -6,11 +6,10 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_codec_dev.h"
-#include "app_audio.h"
-#include "task_webrtc.h"
 
-/* 20 ms @ 8 kHz mono, int16 -> 160 samples -> 160 PCMA bytes per packet. */
-#define AUDIO_READ_BYTES 320
+#include "app_config.h"
+#include "hal_audio.h"
+#include "webrtc_api.h"
 
 static const char *TAG = "audio";
 
@@ -47,7 +46,7 @@ static uint8_t linear16_to_g711a(int16_t sample) {
 void task_audio(void *arg) {
     ESP_LOGD(TAG, "task_audio started");
 
-    esp_codec_dev_handle_t codec = app_audio_get_handle();
+    esp_codec_dev_handle_t codec = hal_audio_get_handle();
     if (!codec) {
         ESP_LOGE(TAG, "codec not initialized");
         vTaskDelete(NULL);
@@ -77,12 +76,8 @@ void task_audio(void *arg) {
             g711a[i] = linear16_to_g711a(pcm[i]);
         }
 
-        if (g_pc && eState == PEER_CONNECTION_COMPLETED) {
-            if (xSemaphoreTake(g_pc_lock, portMAX_DELAY) == pdTRUE) {
-                ESP_LOGD(TAG, "send audio frame: %d bytes", frames);
-                peer_connection_send_audio(g_pc, g711a, frames);
-                xSemaphoreGive(g_pc_lock);
-            }
-        }
+        /* Bounded wait, unlike video's best-effort drop: this task must come
+         * back round within 20 ms or the I2S RX ring overruns. */
+        webrtc_send_audio(g711a, frames, WEBRTC_AUDIO_LOCK_MS);
     }
 }

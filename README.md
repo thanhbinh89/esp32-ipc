@@ -26,9 +26,10 @@ OV5647 (MIPI-CSI) --> ISP (YUV420) --+--> PPA scale --> ESP-DL pedestrian detect
 
 - **Capture** — 1920x1080 packed YUV420 (`O_UYY_E_VYY`, not planar I420), sensor at
   30 fps, 3 mmap'd V4L2 buffers.
-- **Detect** — PPA downscales each frame to 640x360 RGB565 (exactly 1/3 scale); the
-  ESP-DL Pico s8 v1 model runs on core 1 at roughly 13 inferences/s.
-- **Encode** — V4L2 m2m hardware H.264, ~1 Mbps target, QP 35–45, IDR every 5 frames,
+- **Detect** — PPA downscales each frame to 480x270 RGB565. That is exactly 4/16 of the
+  source, the only kind of ratio the PPA's 8.4 fixed-point scaler can express without
+  silently cropping. The ESP-DL Pico s8 v1 model runs on core 1.
+- **Encode** — V4L2 m2m hardware H.264, ~1 Mbps target, QP 22–38, IDR every 60 frames
   plus on-demand IDR on RTCP PLI.
 - **Audio** — ES8311 over I2S, 16-bit mono 8 kHz, encoded as G.711-A (20 ms packets).
 - **Transport** — WebRTC via libpeer: MQTT signaling, STUN/TURN ICE, DTLS-SRTP.
@@ -37,15 +38,33 @@ OV5647 (MIPI-CSI) --> ISP (YUV420) --+--> PPA scale --> ESP-DL pedestrian detect
 
 Everything runs on core 0 except the detector, which owns core 1.
 
-| Task          | Core | Prio | Role                                      |
-| ------------- | ---- | ---- | ----------------------------------------- |
+| Task        | Core | Prio | Role                                      |
+| ----------- | ---- | ---- | ----------------------------------------- |
+| `detect`    | 1    | 7    | ESP-DL inference, box store               |
+| `audio`     | 0    | 6    | PCM read, G.711-A encode, send audio      |
+| `peer`      | 0    | 6    | `peer_connection_loop` (ICE/DTLS/RTP)     |
 | `video_cap` | 0    | 5    | V4L2 dequeue, push descriptors to a queue |
 | `video_enc` | 0    | 5    | PPA feed, OSD, H.264 encode, send video   |
-| `camera`    | 0    | 5    | device setup, then 1 Hz stats             |
-| `audio`     | 0    | 4    | PCM read, G.711-A encode, send audio      |
-| `detect`    | 1    | 7    | ESP-DL inference, box store               |
-| `webrtc`    | 0    | 6    | `peer_signaling_loop` (MQTT)            |
-| `peer`      | 0    | 5    | `peer_connection_loop` (ICE/DTLS/RTP)   |
+| `camera`    | 0    | 5→1  | device setup, then 1 Hz stats             |
+| `webrtc`    | 0    | 3    | `peer_signaling_loop` (MQTT)              |
+
+Priorities track deadline hardness: audio outranks video because a late
+`esp_codec_dev_read()` overruns the I2S ring, while a late frame only costs a frame.
+All of it is declared in [main/app_config.h](main/app_config.h).
+
+## Source layout
+
+```
+main/
+  app_main.cpp     boot only: network up, video + audio init, spawn tasks
+  app_config.h     every tunable: resolutions, rate control, stacks, priorities
+  hal/             thin wrappers over IDF drivers — no app policy, no globals
+  core/            app services: webrtc_api, detector interface, osd, frame_pool
+  task/            one FreeRTOS task per file
+```
+
+`core/webrtc_api.h` is the only route to the PeerConnection, and `core/detector.h`
+the only route to the model — so swapping either never touches the other's code.
 
 ## Prerequisites
 
@@ -132,7 +151,7 @@ in `dependencies.lock`.
 
 ## Known gaps
 
-The current working tree has a few open defects — most importantly the detector feed
-pipeline is passed to `video_task` before it is allocated, so detection is inert. Full
-list: [ARCHITECTURE.md §10](ARCHITECTURE.md#10-known-gaps) and
-[DATAFLOW.md §10](DATAFLOW.md#10-data-flow-defects).
+No open defects. Remaining opportunities — chiefly whether to hardware-accelerate the
+esp-dl preprocessor, and measuring stack high-water marks — are listed in
+[ARCHITECTURE.md §10](ARCHITECTURE.md#10-known-gaps) and
+[DATAFLOW.md §10](DATAFLOW.md#10-data-flow-notes).
