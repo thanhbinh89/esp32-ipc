@@ -20,7 +20,7 @@ extern "C" {
 /* Capture buffers held by the V4L2 driver, and the depth of the queue that hands
  * their descriptors from the capture task to the encode task. One frame is always
  * in the encode task's hands, so the queue only needs to cover the rest. */
-#define CAP_BUF_COUNT       3
+#define CAP_BUF_COUNT       2
 #define VIDEO_QUEUE_LEN     (CAP_BUF_COUNT - 1)
 
 /* More than one bitstream buffer so the encoder can start the next frame while the
@@ -66,7 +66,7 @@ extern "C" {
  */
 #define DET_WIDTH           480
 #define DET_HEIGHT          270
-#define DET_MAX_BOX         10
+#define DET_MAX_BOX         5
 
 /* Feed buffers the camera task fills and the detector drains. Two lets the camera
  * be at most one frame ahead; when both are held, detection is skipped for that

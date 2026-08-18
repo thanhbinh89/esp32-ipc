@@ -244,7 +244,7 @@ failure there is a boot-time panic rather than a recoverable error.
   `CONFIG_ESP_HOSTED_ENABLED` is therefore forced off in
   [sdkconfig.defaults](sdkconfig.defaults), and `APP_NETIF_WIFI` selects it back on.
 - **The detector** must *not* join this phase. `s_detect` is a `PedestrianDetect *`
-  built inside `pedestrian_detect_task_start()`, not a file-scope instance — a static
+  built inside `detector_pedestrian.start()`, not a file-scope instance — a static
   instance would load the esp-dl model from a constructor and take the internal RAM
   that other components' constructors are about to ask for.
 
@@ -322,7 +322,7 @@ sequenceDiagram
     CAP->>CAP: open device, S_FMT YUV420, REQBUFS 3 MMAP
     CAP->>CAP: QUERYBUF + mmap + QBUF each buffer
 
-    TV->>ENC: hal_h264_open(I period 60, 1 Mbps, QP 22-38)
+    TV->>ENC: hal_h264_open(I period 12, 1 Mbps, QP 22-38)
     ENC->>ENC: S_EXT_CTRLS rate control
     ENC->>ENC: S_FMT OUTPUT YUV420 + REQBUFS 1 USERPTR
     ENC->>ENC: S_FMT CAPTURE H264 + REQBUFS 2 MMAP, mmap + QBUF each
@@ -362,7 +362,7 @@ sequenceDiagram
     participant AU as audio
 
     WT->>WT: build PeerConfiguration<br/>ice_servers[0]=CONFIG_STUN_URL, [1]=TURN (if CONFIG_TURN)<br/>audio_codec=CODEC_PCMA, video_codec=CODEC_H264, datachannel=BINARY
-    WT->>WT: g_pc_lock = xSemaphoreCreateMutex()
+    WT->>WT: s_pc_lock = xSemaphoreCreateMutex() (private to task_webrtc.cpp)
     WT->>LP: peer_init()
     WT->>LP: peer_connection_create(&cfg) -> g_pc
     WT->>LP: register oniceconnectionstatechange / ondatachannel / on_request_keyframe
@@ -375,9 +375,9 @@ sequenceDiagram
         end
     and PC loop (peer task)
         loop every 1 ms
-            PT->>PT: take g_pc_lock
+            PT->>PT: take s_pc_lock
             PT->>LP: peer_connection_loop(g_pc) - ICE / DTLS / SRTP / RTP pacing
-            PT->>PT: give g_pc_lock
+            PT->>PT: give s_pc_lock
         end
     end
 
@@ -396,13 +396,13 @@ sequenceDiagram
     Note over VE,AU: both senders gate on (g_pc && eState == PEER_CONNECTION_COMPLETED)
 
     loop per encoded frame
-        VE->>PT: take g_pc_lock (2 ms timeout, else stat_send_fail++)
+        VE->>PT: webrtc_send_video(2 ms timeout, else stat_send_fail++)
         VE->>LP: peer_connection_send_video(g_pc, enc_out_mmap, bytesused)
         LP->>BR: RTP/SRTP H.264 (PT 96, ts += 90000/30)
     end
 
     loop every 20 ms
-        AU->>PT: take g_pc_lock (portMAX_DELAY)
+        AU->>PT: webrtc_send_audio(20 ms timeout)
         AU->>LP: peer_connection_send_audio(g_pc, g711a, 160)
         LP->>BR: RTP/SRTP PCMA (PT 8)
     end
@@ -458,12 +458,28 @@ priority and core assignment. Notable current values:
 | `CAM_WIDTH` / `CAM_HEIGHT` | 1920 / 1080 | |
 | `CAP_BUF_COUNT` / `VIDEO_QUEUE_LEN` | 3 / 2 | queue depth derives from the buffer count |
 | `ENC_OUT_BUF_COUNT` | 2 | lets encode overlap the RTP send |
-| `H264_I_PERIOD` / `BITRATE` / `MIN_QP` / `MAX_QP` | 60 / 1000000 / 22 / 38 | long GOP, PLI-driven IDR |
+| `H264_TARGET_FPS` | 12 | the delivered rate; see §10 for why it is not free |
+| `H264_I_PERIOD` / `BITRATE` / `MIN_QP` / `MAX_QP` | = TARGET_FPS / 1000000 / 22 / 38 | I period is forced equal to the frame rate |
 | `DET_WIDTH` / `DET_HEIGHT` / `DET_MAX_BOX` | 480 / 270 / 10 | exactly 4/16 of the frame |
-| `DET_FEED_ELEMENTS` / `DET_TIMING_WINDOW` | 2 / 16 | |
-| `OSD_Y/U/V`, `OSD_THICKNESS` | 76/84/255, 4 px | red |
-| `AUDIO_READ_BYTES` | 320 | 20 ms @ 8 kHz int16 |
-| `WEBRTC_VIDEO_LOCK_MS` / `_AUDIO_LOCK_MS` | 2 / 20 | video drops, audio waits |
+| `DET_FEED_ELEMENTS` / `DET_FEED_EVERY_N` | 2 / 3 | feed rate-limited to buy back frame rate |
+| `DET_TIMING_WINDOW` | 16 | inferences per `inference avg` log line |
+| `OSD_Y/U/V`, `OSD_THICKNESS`, `OSD_CORNER_LEN` | 76/84/255, 4 px, 48 px | red corner marks |
+| `AUDIO_READ_BYTES` | derived | `CONFIG_AUDIO_DURATION x 8000 / 1000 x 2` = 320 |
+| `WEBRTC_VIDEO_LOCK_MS` / `_AUDIO_LOCK_MS` | 2 / = AUDIO_DURATION | video drops, audio waits |
+
+A second, smaller file holds the values the application shares with libpeer —
+[main/core/libpeer_config.h](main/core/libpeer_config.h). libpeer keeps its own
+defaults behind `#ifndef`, and `main/CMakeLists.txt` force-includes this header into
+that component so these win. `app_config.h` then re-exports them, so neither side can
+drift from the other:
+
+| Constant | Value | Shared with |
+| --- | --- | --- |
+| `CONFIG_CODEC_H264_FPS` | 12 | RTP video timestamp step = 90000 / this; also `H264_TARGET_FPS` |
+| `CONFIG_AUDIO_DURATION` | 20 ms | RTP audio timestamp step; also `AUDIO_READ_BYTES` |
+| `CONFIG_VIDEO_BUFFER_SIZE` | 153 600 B | outgoing ring, must hold the largest IDR |
+| `CONFIG_AUDIO_BUFFER_SIZE` | 820 B | outgoing ring, ~5 G.711-A packets |
+| `CONFIG_DATA_BUFFER_SIZE` | 1 024 B | outgoing datachannel ring (the app never sends) |
 
 ---
 
@@ -480,8 +496,7 @@ priority and core assignment. Notable current values:
 | `factory`  | app/factory | 0x10000 | **4 MB** |
 
 The 4 MB app partition is oversized on purpose: `PEDESTRIAN_DETECT_MODEL_IN_FLASH_RODATA`
-links the packed `.espdl` model into the binary, and `canon.pcm` (625 KB) is embedded
-via `EMBED_FILES`.
+links the packed `.espdl` model into the binary.
 
 ### RAM
 

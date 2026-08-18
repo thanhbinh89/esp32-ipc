@@ -26,11 +26,13 @@ OV5647 (MIPI-CSI) --> ISP (YUV420) --+--> PPA scale --> ESP-DL pedestrian detect
 
 - **Capture** — 1920x1080 packed YUV420 (`O_UYY_E_VYY`, not planar I420), sensor at
   30 fps, 3 mmap'd V4L2 buffers.
-- **Detect** — PPA downscales each frame to 480x270 RGB565. That is exactly 4/16 of the
-  source, the only kind of ratio the PPA's 8.4 fixed-point scaler can express without
-  silently cropping. The ESP-DL Pico s8 v1 model runs on core 1.
-- **Encode** — V4L2 m2m hardware H.264, ~1 Mbps target, QP 22–38, IDR every 60 frames
-  plus on-demand IDR on RTCP PLI.
+- **Detect** — PPA downscales to 480x270 RGB565, exactly 4/16 of the source: the only
+  kind of ratio the PPA's 8.4 fixed-point scaler can express without silently cropping.
+  Fed every 3rd frame, because one PPA call costs more than the rest of the encode loop
+  put together. The ESP-DL Pico s8 v1 model runs on core 1.
+- **Encode** — V4L2 m2m hardware H.264, ~1 Mbps target, QP 22–38. The driver has no
+  force-keyframe control and reuses the I-period as the assumed frame rate, so the GOP
+  is pinned to the delivered rate (12) rather than chosen freely.
 - **Audio** — ES8311 over I2S, 16-bit mono 8 kHz, encoded as G.711-A (20 ms packets).
 - **Transport** — WebRTC via libpeer: MQTT signaling, STUN/TURN ICE, DTLS-SRTP.
 

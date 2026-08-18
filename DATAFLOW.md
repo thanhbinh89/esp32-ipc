@@ -19,7 +19,7 @@ graph TD
     FEED["feed pipeline<br/>2 x 259 200 B RGB565<br/>SPIRAM, 128-B aligned"]
     DL["ESP-DL Pico s8 v1<br/>preproc -> infer -> NMS"]
     BSTORE["s_boxes[10] + s_box_count<br/>guarded by s_box_mutex"]
-    OSDB["osd_draw_rect_yuv420()<br/>in-place on the capture buffer"]
+    OSDB["osd_draw_boxes_yuv420()<br/>corner marks, in place<br/>reports dirtied row bands"]
     H264["H.264 HW encoder (m2m)<br/>OUTPUT: USERPTR YUV420<br/>CAPTURE: MMAP bitstream"]
     ENCBUF["enc_out_mmap<br/>2 slots"]
     LP["libpeer<br/>RTP -> SRTP -> ICE"]
@@ -110,10 +110,10 @@ sequenceDiagram
 
         ENC->>BSTORE: osd_draw_boxes_yuv420(yuv_frame)
         BSTORE-->>ENC: snapshot boxes under s_box_mutex
-        ENC->>ENC: osd_draw_rect_yuv420() x N, coords x4, red, 4 px
+        ENC->>ENC: osd_draw_boxes_yuv420() - corner marks, coords x4, red
     end
 
-    ENC->>ENC: esp_cache_msync(yuv_frame, cap_buffer_len, DIR_C2M or UNALIGNED)
+    ENC->>CAP: hal_vcap_publish_rows() per dirtied band
 
     ENC->>HW: VIDIOC_QBUF(OUTPUT, USERPTR = yuv_frame, length = bytesused)
     ENC->>HW: VIDIOC_DQBUF(CAPTURE/MMAP) -> enc_out_buf
@@ -161,20 +161,20 @@ driver actually handed back, so the send never reads the wrong slot.
 ### 3.1 The feed pipeline
 
 [frame_pool.cpp](main/core/frame_pool.cpp) is a two-list ring: every
-element is in `queued_list`, in `done_list`, or detached and owned by a task. The `free`
-flag means *detached*, not *unused*.
+element is on the `free_list`, on the `ready_list`, or checked out by a task — the
+`checked_out` flag says which.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Queued: frame_pool_new()<br/>allocates 2 elements, queues both
-    Queued --> HeldByProducer: frame_pool_acquire()<br/>(video_enc)
-    HeldByProducer --> Queued: PPA failed -><br/>frame_pool_release()
-    HeldByProducer --> Done: frame_pool_submit()<br/>+ xSemaphoreGive(ready_sem)
-    Done --> HeldByConsumer: frame_pool_recv()<br/>(detect, takes ready_sem)
-    HeldByConsumer --> Queued: frame_pool_release()<br/>after inference
+    [*] --> Free: frame_pool_new()<br/>allocates 2 elements, both free
+    Free --> HeldByProducer: frame_pool_acquire()<br/>(video_enc)
+    HeldByProducer --> Free: PPA failed -><br/>frame_pool_release()
+    HeldByProducer --> Ready: frame_pool_submit()<br/>+ xSemaphoreGive(ready_sem)
+    Ready --> HeldByConsumer: frame_pool_recv()<br/>(detect, takes ready_sem)
+    HeldByConsumer --> Free: frame_pool_release()<br/>after inference
 ```
 
-- List mutation is protected by `portMUX_TYPE stream_lock`
+- List mutation is protected by a `portMUX_TYPE` spinlock
   (`portENTER_CRITICAL_SAFE`), so it is ISR-safe; `frame_pool_submit()` is
   `IRAM_ATTR` and branches on `xPortInIsrContext()`.
 - `ready_sem` is a counting semaphore with max = `elem_num` (2), initial 0.
@@ -227,7 +227,7 @@ OSD_SCALE_Y = CAM_HEIGHT / DET_HEIGHT = 4
 
 480x270 is chosen as an exact 1/3 of 1080p and keeps 16:9, so the upscale is a lossless
 integer multiply with no aspect distortion and no letterbox offset to compensate.
-`osd_draw_rect_yuv420()` clips out-of-range pixels itself, so rounding at the edges is
+`osd_draw_boxes_yuv420()` clips out-of-range pixels itself, so rounding at the edges is
 harmless.
 
 ---
@@ -326,7 +326,9 @@ sequenceDiagram
     end
 ```
 
-- 320 B PCM -> 160 B A-law: exactly one 20 ms RTP packet, matching WebRTC's default
+- 320 B PCM -> 160 B A-law: exactly one `CONFIG_AUDIO_DURATION` (20 ms) RTP packet. Both
+  sides derive from that one macro, so the payload can never disagree with the timestamp
+  step libpeer applies. Matches WebRTC's default
   PCMA packetisation, so no jitter-buffer reshaping is needed on the browser side.
 - `linear16_to_g711a()` ([task_audio.cpp:17-45](main/task/task_audio.cpp#L17-L45)) is the
   standard ITU-T G.711 A-law compander: magnitude, 8-segment log search, `^ 0xD5` for
@@ -343,29 +345,37 @@ enabled, so the hardware supports two-way audio. But:
 
 - no inbound audio-track callback is registered on the `PeerConnection`, so received
   RTP audio is never routed anywhere;
-- `task_speaker` — which would loop the embedded `canon.pcm` through
-  `esp_codec_dev_write()` — is compiled and linked but **never created** by `app_main`.
+- nothing drives the speaker: `task_speaker` and its embedded `canon.pcm` were deleted,
+  since the task was never created and the asset cost 625 KB of the app partition.
 
-So the speaker path exists only as dead code plus a 625 KB payload in the app partition.
+So the hardware could carry return audio, but no code path does.
 
 ---
 
 ## 6. Cache coherency
 
-PSRAM buffers are shared between CPU and DMA masters (ISP, PPA, H.264), so every
-handoff needs an explicit `esp_cache_msync()` in the right direction.
+PSRAM buffers are shared between the CPU and DMA masters (ISP, PPA, H.264), so every
+handoff needs an `esp_cache_msync()` in the right direction. Each one lives with the
+module that owns the buffer, not with the code that happens to touch it:
 
-| Call site                                     | Buffer                     | Flags                   | Why                                                                                                                   |
-| --------------------------------------------- | -------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| [task_video.cpp:130](main/task/task_video.cpp#L130) | RGB565 feed element        | `DIR_M2C`             | PPA (DMA) just wrote it;**invalidate** so the detector's CPU reads see fresh bytes instead of stale cache lines |
-| [task_video.cpp:209](main/task/task_video.cpp#L209) | full YUV420 capture buffer | `DIR_C2M \| UNALIGNED` | the CPU just drew OSD boxes into it;**write back** so the H.264 DMA sees them                                   |
+| Owner | Buffer | Flags | Why |
+| --- | --- | --- | --- |
+| [hal_ppa.c](main/hal/hal_ppa.c) | RGB565 feed element | `DIR_M2C` | the PPA (DMA) just wrote it — **invalidate** so the detector's CPU reads see fresh bytes, not stale cache lines |
+| [hal_video_capture.c](main/hal/hal_video_capture.c) | dirtied rows of the YUV420 capture buffer | `DIR_C2M \| UNALIGNED` | the CPU just drew OSD marks — **write back** so the H.264 DMA sees them |
 
-The `UNALIGNED` flag is required on the capture buffer because its length
-(3 110 400 B for 1080p) and mmap address are not guaranteed to be multiples of the
-128-byte L2 line configured by `CONFIG_CACHE_L2_CACHE_LINE_128B`. The feed elements need
-no such flag: `frame_pool_new()` allocates them with
-`heap_caps_aligned_calloc(align_size = 128, ...)` and the size 460 800 is itself a
-multiple of 128.
+`hal_vcap_publish_rows()` is the reason `core/osd.c` reports row bands instead of doing
+the flush itself: the OSD knows which pixels it wrote, the capture HAL knows the buffer
+geometry and that DMA reads it next, and neither needs the other's knowledge.
+
+The `UNALIGNED` flag is required because a band's start address and length are multiples
+of the row stride (2 880 B), not of the 128-byte L2 line configured by
+`CONFIG_CACHE_L2_CACHE_LINE_128B`. The feed elements need no such flag: `frame_pool_new()`
+allocates them with `heap_caps_aligned_calloc(align_size = 128, ...)` and 259 200 is
+itself a multiple of 128.
+
+**A frame the CPU never wrote needs no call at all.** With no detections there is
+nothing to publish, which is most of why the OSD stage now measures under 2 ms — see §7
+for the part of that saving the PPA driver takes back.
 
 ---
 
@@ -462,6 +472,7 @@ graph TD
 | Drop point                           | Counter            | Effect                                                   |
 | ------------------------------------ | ------------------ | -------------------------------------------------------- |
 | `cap_queue` full                   | `stat_cap_drop`  | frame dropped; the buffer goes straight back to the driver |
+| not this frame's turn (`DET_FEED_EVERY_N`) | *(none)* | detection skipped deliberately, to buy back frame rate |
 | no free feed element                 | *(none)*         | detection skipped for that frame; video unaffected       |
 | PPA failure                          | *(none)*         | element returned unused, detection skipped               |
 | PC not`COMPLETED`                  | *(none)*         | encoded frame discarded before send                      |
@@ -498,18 +509,30 @@ sequenceDiagram
     Note over VE: next loop iteration
     VE->>CB: webrtc_take_keyframe_request() - read-and-clear
     CB-->>VE: true
-    VE->>HW: VIDIOC_S_EXT_CTRLS V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME = 1
-    HW-->>VE: next encoded frame is an IDR
+    VE->>HW: VIDIOC_S_EXT_CTRLS FORCE_KEY_FRAME = 1
+    HW-->>VE: ESP_ERR_NOT_SUPPORTED - the driver has no such control
+    Note over VE,HW: latched after the first attempt - the browser waits<br/>for the periodic IDR instead, every H264_I_PERIOD frames
 ```
 
-`webrtc_take_keyframe_request()` is a non-atomic read-then-clear on a `volatile bool`.
-A request arriving in the window between the read and the clear is lost; in practice the
-browser retries the PLI, and `H264_I_PERIOD = 60` means an IDR arrives within 60 frames
-anyway.
+**The PLI path does not actually reach the encoder.** esp_video's H.264 device
+implements only four ext-controls (I_PERIOD, BITRATE, MIN_QP, MAX_QP) and rejects
+`FORCE_KEY_FRAME`; it also reads `gop` only when it builds the encoder at STREAMON, so
+the period cannot be shortened at runtime either. `hal_h264_force_idr()` therefore tries
+once, logs the limitation, and latches off — a browser sends a PLI burst, and three
+driver error lines per PLI would bury the rest of the log.
+
+Recovery is left to the periodic IDR, which is why `H264_I_PERIOD` is pinned to
+`H264_TARGET_FPS`: one IDR per second of wall clock, so a joining browser syncs in about
+a second.
+
+`webrtc_take_keyframe_request()` is a non-atomic read-then-clear on a `volatile bool`, so
+a request arriving between the read and the clear is lost — immaterial, since the browser
+retries and the periodic IDR is what serves it anyway.
 
 The data channel (`DATA_CHANNEL_BINARY`) is negotiated and its open/close/message
 callbacks are registered, but `on_dc_message()` only logs at `ESP_LOGD` level — no
-commands are parsed and nothing is ever sent back over it.
+commands are parsed and nothing is ever sent back over it. Its outgoing ring is sized
+accordingly (`CONFIG_DATA_BUFFER_SIZE`, 1 KB).
 
 ---
 
