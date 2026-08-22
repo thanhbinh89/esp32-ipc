@@ -82,3 +82,4 @@ Desktop.ini
 .agents/
 .devcontainer/
 .vscode/
+**/node_modules
