@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -38,6 +39,8 @@ typedef struct {
 
     uint32_t stat_cap;
     uint32_t stat_cap_drop;
+    uint32_t stat_cap_pace;
+    uint32_t stat_loop;
     uint32_t stat_enc;
     uint32_t stat_send_ok;
     uint32_t stat_send_fail;
@@ -45,7 +48,15 @@ typedef struct {
 
     /* Per-stage cost of the encode loop, summed over the reporting window.
      * The loop is fully serial, so these add up to the frame interval and show
-     * directly which stage caps the frame rate. */
+     * directly which stage caps the frame rate.
+     *
+     * us_wait is the odd one out and the most useful: it is time spent blocked in
+     * xQueueReceive with no frame to work on. A large us_wait means the camera is
+     * the limit and this task is idle; a small us_wait with a large total means
+     * this task is the limit. Without it the two are indistinguishable, because
+     * every stage is measured in wall-clock and therefore also charges whatever
+     * preempted the task mid-stage. */
+    int64_t us_wait;
     int64_t us_ppa;
     int64_t us_osd;
     int64_t us_enc;
@@ -53,6 +64,26 @@ typedef struct {
 } video_ctx_t;
 
 static video_ctx_t s_ctx;
+
+/* True for the frames that keep the pipeline at H264_TARGET_FPS, false for the
+ * ones the sensor produces in between — see VIDEO_FRAME_INTERVAL_US. */
+static bool on_frame_grid(void) {
+    static int64_t next_us;
+
+    int64_t now = esp_timer_get_time();
+    if (now < next_us) {
+        return false;
+    }
+
+    next_us += VIDEO_FRAME_INTERVAL_US;
+    if (next_us <= now) {
+        /* More than a whole interval late: a slow encode, or the first frame.
+         * Restart the grid from here instead of letting the accumulated deficit
+         * pass a burst of frames straight through. */
+        next_us = now + VIDEO_FRAME_INTERVAL_US;
+    }
+    return true;
+}
 
 /*
  * Drain the capture device as fast as it produces frames, handing descriptors —
@@ -65,6 +96,19 @@ static void video_capture_task(void *arg) {
     while (true) {
         hal_vcap_frame_t frame;
         if (hal_vcap_acquire(&s_ctx.cap, &frame) != ESP_OK) {
+            /* A stalled DQBUF already cost VIDEO_DQBUF_TIMEOUT_MS, but a failure
+             * that returns instantly would spin this task at priority 5 and starve
+             * the stats task that reports it. Pace the retry either way. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        /* Drop before the queue, not inside the encode task: the buffer goes
+         * straight back to the driver and no stage downstream spends anything on
+         * a frame that was never going to be sent. */
+        if (!on_frame_grid()) {
+            s_ctx.stat_cap_pace++;
+            hal_vcap_release(&s_ctx.cap, &frame);
             continue;
         }
         s_ctx.stat_cap++;
@@ -124,28 +168,41 @@ static void video_encode_task(void *arg) {
 
     while (true) {
         hal_vcap_frame_t frame;
+        int64_t tw = esp_timer_get_time();
         if (xQueueReceive(s_ctx.cap_queue, &frame, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        int64_t t0 = esp_timer_get_time();
+        s_ctx.stat_loop++;
+        s_ctx.us_wait += t0 - tw;
 
         if (webrtc_take_keyframe_request()) {
             ESP_LOGI(TAG, "keyframe requested");
             hal_h264_force_idr(&s_ctx.enc);
         }
 
-        int64_t t0 = esp_timer_get_time();
         feed_detector(frame.data);
         int64_t t1 = esp_timer_get_time();
         overlay_boxes(&frame);
         int64_t t2 = esp_timer_get_time();
 
         hal_h264_bitstream_t bits;
-        if (hal_h264_encode(&s_ctx.enc, frame.data, frame.bytesused, &bits) == ESP_OK) {
-            int64_t t3 = esp_timer_get_time();
+        esp_err_t encoded = hal_h264_encode(&s_ctx.enc, frame.data, frame.bytesused, &bits);
+        int64_t t3 = esp_timer_get_time();
+
+        /* Hand the capture buffer back here, not at the end of the loop.
+         * hal_h264_encode() dequeues its input slot before returning, so the
+         * encoder has finished reading the frame and nothing below touches it.
+         * Holding it across the send would keep it out of the driver's hands for
+         * the whole packetise-and-transmit stage -- see CAP_BUF_COUNT for why the
+         * driver running out of buffers costs whole frames rather than latency. */
+        hal_vcap_release(&s_ctx.cap, &frame);
+
+        if (encoded == ESP_OK) {
             s_ctx.stat_enc++;
             s_ctx.stat_bytes += bits.bytesused;
 
-            int sent = webrtc_send_video(bits.data, bits.bytesused, WEBRTC_VIDEO_LOCK_MS);
+            int sent = webrtc_send_video(bits.data, bits.bytesused);
             if (sent > 0) {
                 s_ctx.stat_send_ok++;
             } else if (sent < 0) {
@@ -153,13 +210,11 @@ static void video_encode_task(void *arg) {
             }
             hal_h264_release(&s_ctx.enc, &bits);
 
-            s_ctx.us_enc += t3 - t2;
             s_ctx.us_send += esp_timer_get_time() - t3;
         }
         s_ctx.us_ppa += t1 - t0;
         s_ctx.us_osd += t2 - t1;
-
-        hal_vcap_release(&s_ctx.cap, &frame);
+        s_ctx.us_enc += t3 - t2;
     }
 }
 
@@ -170,23 +225,35 @@ static void log_stats(int64_t *last_us) {
         return;
     }
 
-    uint32_t n = s_ctx.stat_enc ? s_ctx.stat_enc : 1;
-    ESP_LOGI(TAG, "%ums: cap=%u cap_drop=%u enc=%u send_ok=%u send_fail=%u bitrate=%ukbps q_cap=%u",
-             elapsed_ms, s_ctx.stat_cap, s_ctx.stat_cap_drop, s_ctx.stat_enc,
+    /* Per-loop, not per-encoded-frame: every stage below is accumulated once per
+     * iteration, so dividing by the number of *successful* encodes inflated all of
+     * them whenever hal_h264_encode() failed. enc= is printed alongside cap= so a
+     * gap between the two is still visible. */
+    uint32_t n = s_ctx.stat_loop ? s_ctx.stat_loop : 1;
+    ESP_LOGI(TAG, "%ums: cap=%u pace_drop=%u cap_drop=%u enc=%u send_ok=%u send_fail=%u bitrate=%ukbps q_cap=%u iram=%u/%u",
+             elapsed_ms, s_ctx.stat_cap, s_ctx.stat_cap_pace, s_ctx.stat_cap_drop, s_ctx.stat_enc,
              s_ctx.stat_send_ok, s_ctx.stat_send_fail,
              (unsigned)((s_ctx.stat_bytes * 8ULL) / elapsed_ms),
-             (unsigned)uxQueueMessagesWaiting(s_ctx.cap_queue));
-    ESP_LOGI(TAG, "  per frame: ppa=%.1fms osd=%.1fms enc=%.1fms send=%.1fms total=%.1fms",
-             s_ctx.us_ppa / (1000.0 * n), s_ctx.us_osd / (1000.0 * n),
-             s_ctx.us_enc / (1000.0 * n), s_ctx.us_send / (1000.0 * n),
+             (unsigned)uxQueueMessagesWaiting(s_ctx.cap_queue),
+             /* free / largest contiguous internal block: the network stack competes
+              * for this and a signaling message went missing when it ran low. */
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "  per frame: wait=%.1fms ppa=%.1fms osd=%.1fms enc=%.1fms send=%.1fms busy=%.1fms",
+             s_ctx.us_wait / (1000.0 * n), s_ctx.us_ppa / (1000.0 * n),
+             s_ctx.us_osd / (1000.0 * n), s_ctx.us_enc / (1000.0 * n),
+             s_ctx.us_send / (1000.0 * n),
              (s_ctx.us_ppa + s_ctx.us_osd + s_ctx.us_enc + s_ctx.us_send) / (1000.0 * n));
 
     s_ctx.stat_cap = 0;
     s_ctx.stat_cap_drop = 0;
+    s_ctx.stat_cap_pace = 0;
+    s_ctx.stat_loop = 0;
     s_ctx.stat_enc = 0;
     s_ctx.stat_send_ok = 0;
     s_ctx.stat_send_fail = 0;
     s_ctx.stat_bytes = 0;
+    s_ctx.us_wait = 0;
     s_ctx.us_ppa = 0;
     s_ctx.us_osd = 0;
     s_ctx.us_enc = 0;
@@ -228,6 +295,9 @@ void task_video(void *arg) {
     if (s_ctx.det->start() != ESP_OK) {
         ESP_LOGW(TAG, "detector unavailable; streaming without detection");
     }
+    ESP_LOGI(TAG, "internal RAM after detector    : free %6u, largest block %6u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     xTaskCreatePinnedToCore(video_capture_task, "video_cap", TASK_CAPTURE_STACK_SIZE, NULL,
                             TASK_PRIO_VIDEO_CAP, NULL, TASK_CORE_VIDEO);

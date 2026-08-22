@@ -1,6 +1,154 @@
 --- a/src/agent.c
 +++ b/src/agent.c
-@@ -235,6 +235,7 @@
+@@ -15,7 +15,7 @@
+ #define AGENT_POLL_TIMEOUT 1
+ #define AGENT_CONNCHECK_MAX 1000
+ #define AGENT_CONNCHECK_PERIOD 100
+-#define AGENT_STUN_RECV_MAXTIMES 1000
++#define AGENT_STUN_RECV_TIMEOUT_MS 1000
+ 
+ void agent_clear_candidates(Agent* agent) {
+   agent->local_candidates_count = 0;
+@@ -98,15 +98,58 @@
+   return ret;
+ }
+ 
+-static int agent_socket_recv_attempts(Agent* agent, Address* addr, uint8_t* buf, int len, int maxtimes) {
+-  int ret = -1;
+-  int i = 0;
+-  for (i = 0; i < maxtimes; i++) {
+-    if ((ret = agent_socket_recv(agent, addr, buf, len)) != 0) {
+-      break;
++/*
++ * Wait for a STUN reply of the expected kind, discarding anything else.
++ *
++ * Two separate faults made gathering unreliable, and both live here.
++ *
++ * The budget was a spin count, not a timeout. Every pass select()s for
++ * AGENT_POLL_TIMEOUT ms, so 1000 passes was meant to be a second, but lwIP
++ * rounds a sub-tick timeout down to a non-blocking poll: the loop never waited
++ * and the budget collapsed to however long 1000 polls took -- measured 35 ms on
++ * this target, shorter than one round trip to the server, and stretching or
++ * shrinking with whatever else happened to be running. Sleeping the poll
++ * interval restores the intended meaning and stops this being a busy-wait at
++ * the peer task's priority.
++ *
++ * And the first datagram to arrive is not necessarily the answer to the request
++ * just sent. Gathering uses one socket for every server, so when the stun: and
++ * turn: URLs resolve to the same host -- the usual arrangement -- the Binding
++ * Success from the STUN step is still queued when the TURN step reads. Taking it
++ * made agent_create_turn_addr() reject it as an "Invalid TURN Binding Response"
++ * and return with no relay candidate, leaving ICE nothing that could reach a
++ * peer off the LAN. Transaction ids cannot separate the two: stun_msg_create()
++ * writes the same constant into every message. Match on what the reply says it
++ * is instead.
++ *
++ * The connectivity-check loop is untouched -- it calls agent_socket_recv()
++ * directly and keeps its non-blocking behaviour.
++ */
++static int agent_socket_recv_stun(Agent* agent, StunMessage* msg, StunClass expect_class,
++                                  StunMethod expect_method, int timeout_ms) {
++  uint32_t deadline = ports_get_epoch_time() + timeout_ms;
++  int ret;
++
++  do {
++    ret = agent_socket_recv(agent, NULL, msg->buf, sizeof(msg->buf));
++    if (ret < 0) {
++      return ret;
+     }
+-  }
+-  return ret;
++
++    if (ret > 0) {
++      stun_parse_msg_buf(msg);
++      if (msg->stunclass == expect_class && msg->stunmethod == expect_method) {
++        return ret;
++      }
++      LOGD("Ignoring STUN class 0x%04x method 0x%04x, waiting for 0x%04x/0x%04x",
++           msg->stunclass, msg->stunmethod, expect_class, expect_method);
++      continue;
++    }
++
++    ports_sleep_ms(AGENT_POLL_TIMEOUT);
++  } while (ports_get_epoch_time() < deadline);
++
++  return 0;
+ }
+ 
+ static int agent_socket_send(Agent* agent, Address* addr, const uint8_t* buf, int len) {
+@@ -163,13 +206,13 @@
+     return ret;
+   }
+ 
+-  ret = agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
++  ret = agent_socket_recv_stun(agent, &recv_msg, STUN_CLASS_RESPONSE, STUN_METHOD_BINDING,
++                               AGENT_STUN_RECV_TIMEOUT_MS);
+   if (ret <= 0) {
+     LOGD("Failed to receive STUN Binding Response.");
+     return ret;
+   }
+ 
+-  stun_parse_msg_buf(&recv_msg);
+   memcpy(&bind_addr, &recv_msg.mapped_addr, sizeof(Address));
+   IceCandidate* ice_candidate = agent->local_candidates + agent->local_candidates_count++;
+   ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_SRFLX, &bind_addr);
+@@ -194,26 +237,21 @@
+     return -1;
+   }
+ 
+-  ret = agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
++  ret = agent_socket_recv_stun(agent, &recv_msg, STUN_CLASS_ERROR, STUN_METHOD_ALLOCATE,
++                               AGENT_STUN_RECV_TIMEOUT_MS);
+   if (ret <= 0) {
+-    LOGD("Failed to receive STUN Binding Response.");
++    LOGE("Invalid TURN Binding Response.");
+     return ret;
+   }
+ 
+-  stun_parse_msg_buf(&recv_msg);
+-
+-  if (recv_msg.stunclass == STUN_CLASS_ERROR && recv_msg.stunmethod == STUN_METHOD_ALLOCATE) {
+-    memset(&send_msg, 0, sizeof(send_msg));
+-    stun_msg_create(&send_msg, STUN_METHOD_ALLOCATE);
+-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);  // UDP
+-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_USERNAME, strlen(username), (char*)username);
+-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_NONCE, strlen(recv_msg.nonce), recv_msg.nonce);
+-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REALM, strlen(recv_msg.realm), recv_msg.realm);
+-    stun_msg_finish(&send_msg, STUN_CREDENTIAL_LONG_TERM, credential, strlen(credential));
+-  } else {
+-    LOGE("Invalid TURN Binding Response.");
+-    return -1;
+-  }
++  /* Retry the allocation, now carrying the realm and nonce from the 401. */
++  memset(&send_msg, 0, sizeof(send_msg));
++  stun_msg_create(&send_msg, STUN_METHOD_ALLOCATE);
++  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);  // UDP
++  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_USERNAME, strlen(username), (char*)username);
++  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_NONCE, strlen(recv_msg.nonce), recv_msg.nonce);
++  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REALM, strlen(recv_msg.realm), recv_msg.realm);
++  stun_msg_finish(&send_msg, STUN_CREDENTIAL_LONG_TERM, credential, strlen(credential));
+ 
+   ret = agent_socket_send(agent, serv_addr, send_msg.buf, send_msg.size);
+   if (ret < 0) {
+@@ -221,13 +259,15 @@
+     return -1;
+   }
+ 
+-  agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
++  /* ret was previously left over from the send above, so a lost allocation
++   * response fell through and turned an all-zero relayed_addr into a candidate. */
++  ret = agent_socket_recv_stun(agent, &recv_msg, STUN_CLASS_RESPONSE, STUN_METHOD_ALLOCATE,
++                               AGENT_STUN_RECV_TIMEOUT_MS);
+   if (ret <= 0) {
+     LOGD("Failed to receive TURN Binding Response.");
+     return ret;
+   }
+ 
+-  stun_parse_msg_buf(&recv_msg);
+   memcpy(&turn_addr, &recv_msg.relayed_addr, sizeof(Address));
+   IceCandidate* ice_candidate = agent->local_candidates + agent->local_candidates_count++;
+   ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_RELAY, &turn_addr);
+@@ -235,6 +275,7 @@
  }
  
  void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential) {
@@ -8,7 +156,7 @@
    char* pos;
    int port;
    char hostname[64];
-@@ -245,7 +246,9 @@
+@@ -245,7 +286,9 @@
    memset(hostname, 0, sizeof(hostname));
  
    if (urls == NULL) {
@@ -18,7 +166,7 @@
      return;
    }
  
-@@ -269,14 +272,17 @@
+@@ -269,14 +312,17 @@
        LOGI("Resolved stun/turn server %s:%d", addr_string, port);
  
        if (strncmp(urls, "stun:", 5) == 0) {
@@ -38,7 +186,7 @@
  }
  
  void agent_get_local_description(Agent* agent, char* description, int length) {
-@@ -414,7 +420,8 @@
+@@ -414,7 +460,8 @@
        strncpy(agent->remote_upwd, line_start + strlen("a=ice-pwd:"), line_end - line_start - strlen("a=ice-pwd:"));
  
      } else if (strncmp(line_start, "a=candidate:", strlen("a=candidate:")) == 0) {
@@ -89,14 +237,57 @@
    rb->head = 0;
    rb->tail = 0;
  }
-@@ -33,7 +53,7 @@
+@@ -32,8 +52,18 @@
+   }
  }
  
++/*
++ * head and tail are each written by exactly one side -- push_tail owns tail and
++ * only reads head, peak/pop own head and only read tail -- so this is a
++ * single-producer/single-consumer ring and needs no mutual exclusion. What it
++ * does need is ordering: the two sides run on different cores, and without a
++ * barrier the consumer can observe a new tail before the payload writes that
++ * precede it have landed, or the producer can start overwriting a slot before
++ * the consumer has finished reading it. __sync_synchronize() is once per frame
++ * on this path, which is nothing next to the memcpy it guards.
++ */
  int buffer_push_tail(Buffer* rb, const uint8_t* data, int size) {
 -  if (!rb || !data || size <= 0) {
 +  if (!rb || !rb->data || rb->size <= 0 || !data || size <= 0) {
      return -1;
    }
+ 
+@@ -57,12 +87,14 @@
+     int* p = (int*)(rb->data + rb->tail);
+     *p = size;
+     memcpy(rb->data, data, size);
++    __sync_synchronize();
+     rb->tail = size;
+ 
+   } else {
+     int* p = (int*)(rb->data + rb->tail);
+     *p = size;
+     memcpy(rb->data + rb->tail + 4, data, size);
++    __sync_synchronize();
+     rb->tail = tail_end;
+   }
+ 
+@@ -73,6 +105,7 @@
+   if (!rb || rb->head == rb->tail) {
+     return NULL;
+   }
++  __sync_synchronize();
+ 
+   *size = *((int*)(rb->data + rb->head));
+ 
+@@ -99,6 +132,8 @@
+ 
+   int head_end = (rb->head + align_size) % rb->size;
+ 
++  __sync_synchronize();
++
+   if (head_end < rb->head) {
+     rb->head = *size;
  
 --- a/src/config.h
 +++ b/src/config.h
@@ -226,7 +417,47 @@
      return -1;
 --- a/src/peer_connection.c
 +++ b/src/peer_connection.c
-@@ -174,6 +174,9 @@
+@@ -7,6 +7,10 @@
+ #include "buffer.h"
+ #include "config.h"
+ #include "dtls_srtp.h"
++#ifdef ESP_PLATFORM
++#include "esp_heap_caps.h"
++#endif
++
+ #include "peer_connection.h"
+ #include "ports.h"
+ #include "rtcp.h"
+@@ -159,7 +163,28 @@
+ }
+ 
+ PeerConnection* peer_connection_create(PeerConfiguration* config) {
++#ifdef ESP_PLATFORM
++  /* ~25 KB in one contiguous block, touched per packet by ICE, DTLS and SRTP, so
++     PSRAM latency shows up directly in connection setup time -- measured 39 ms ->
++     130 ms for the DTLS init alone. Prefer internal RAM and fall back only when
++     there is genuinely no block left, which beats both failing outright (WebRTC
++     never starts) and a project-wide SPIRAM_USE_MALLOC (that one pushed esp-dl
++     inference from 93 ms to 530 ms). */
++  PeerConnection* pc = (PeerConnection*)calloc(1, sizeof(PeerConnection));
++  if (!pc) {
++    LOGW("PeerConnection: %d B did not fit in internal RAM (free %d, largest block %d); falling back to PSRAM",
++         (int)sizeof(PeerConnection),
++         (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++         (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
++    pc = (PeerConnection*)heap_caps_calloc(1, sizeof(PeerConnection), MALLOC_CAP_SPIRAM);
++  } else {
++    LOGI("PeerConnection: %d B from internal RAM (largest block left %d)",
++         (int)sizeof(PeerConnection),
++         (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
++  }
++#else
+   PeerConnection* pc = calloc(1, sizeof(PeerConnection));
++#endif
+   if (!pc) {
+     return NULL;
+   }
+@@ -174,6 +199,9 @@
  #if (CONFIG_DATA_BUFFER_SIZE) > 0
      LOGI("Datachannel allocates heap size: %d", CONFIG_DATA_BUFFER_SIZE);
      pc->data_rb = buffer_new(CONFIG_DATA_BUFFER_SIZE);
@@ -236,7 +467,7 @@
  #endif
    }
  
-@@ -181,6 +184,9 @@
+@@ -181,6 +209,9 @@
  #if (CONFIG_AUDIO_BUFFER_SIZE) > 0
      LOGI("Audio allocates heap size: %d", CONFIG_AUDIO_BUFFER_SIZE);
      pc->audio_rb = buffer_new(CONFIG_AUDIO_BUFFER_SIZE);
@@ -246,7 +477,7 @@
  #endif
  
      rtp_encoder_init(&pc->artp_encoder, pc->config.audio_codec,
-@@ -194,6 +200,9 @@
+@@ -194,6 +225,9 @@
  #if (CONFIG_VIDEO_BUFFER_SIZE) > 0
      LOGI("Video allocates heap size: %d", CONFIG_VIDEO_BUFFER_SIZE);
      pc->video_rb = buffer_new(CONFIG_VIDEO_BUFFER_SIZE);
@@ -256,7 +487,7 @@
  #endif
      rtp_encoder_init(&pc->vrtp_encoder, pc->config.video_codec,
                       peer_connection_outgoing_rtp_packet, (void*)pc);
-@@ -322,13 +331,18 @@
+@@ -322,13 +356,18 @@
  
  static void peer_connection_state_new(PeerConnection* pc, DtlsSrtpRole role, int isOfferer) {
    char* description = (char*)pc->temp_buf;
@@ -275,7 +506,7 @@
  
    pc->sctp.connected = 0;
  
-@@ -339,15 +353,22 @@
+@@ -339,15 +378,22 @@
      pc->agent.mode = AGENT_MODE_CONTROLLED;
    }
  
@@ -299,7 +530,7 @@
  
    memset(&pc->local_sdp, 0, sizeof(pc->local_sdp));
    // TODO: check if we have video or audio codecs
-@@ -398,9 +419,14 @@
+@@ -398,9 +444,14 @@
    }
  
    pc->b_local_description_created = 1;
@@ -314,7 +545,7 @@
    }
  }
  
-@@ -415,20 +441,24 @@
+@@ -415,20 +466,24 @@
      case PEER_CONNECTION_NEW:
  
        if (!pc->b_local_description_created) {
@@ -340,18 +571,25 @@
        if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
          LOGD("DTLS-SRTP handshake done");
  
-@@ -474,16 +504,14 @@
+@@ -443,22 +498,27 @@
+       break;
      case PEER_CONNECTION_COMPLETED:
-
- #if (CONFIG_VIDEO_BUFFER_SIZE) > 0
+ 
+-#if (CONFIG_VIDEO_BUFFER_SIZE) > 0
 -      data = buffer_peak_head(pc->video_rb, &bytes);
 -      if (data) {
-+      while ((data = buffer_peak_head(pc->video_rb, &bytes)) != NULL) {
-         rtp_encoder_encode(&pc->vrtp_encoder, data, bytes);
-         buffer_pop_head(pc->video_rb);
-       }
- #endif
-
+-        rtp_encoder_encode(&pc->vrtp_encoder, data, bytes);
+-        buffer_pop_head(pc->video_rb);
+-      }
+-#endif
+-
++      /* Audio first. Video is drained in bursts -- one 1080p IDR is 40-odd RTP
++       * packets and the whole ring goes out in a single pass -- while audio is
++       * 164 B every 20 ms into a ring that holds a fraction of a second. Draining
++       * video first put a whole video burst between two audio drains, and the
++       * audio ring overflowed for most of a session (2854 "no enough space" in 70
++       * seconds). Reversing them costs video nothing: it is the bulk stream and a
++       * few hundred microseconds of audio ahead of it changes no deadline. */
  #if (CONFIG_AUDIO_BUFFER_SIZE) > 0
 -      data = buffer_peak_head(pc->audio_rb, &bytes);
 -      if (data) {
@@ -359,16 +597,28 @@
          rtp_encoder_encode(&pc->artp_encoder, data, bytes);
          buffer_pop_head(pc->audio_rb);
        }
-@@ -532,6 +560,8 @@
+ #endif
+ 
++#if (CONFIG_VIDEO_BUFFER_SIZE) > 0
++      while ((data = buffer_peak_head(pc->video_rb, &bytes)) != NULL) {
++        rtp_encoder_encode(&pc->vrtp_encoder, data, bytes);
++        buffer_pop_head(pc->video_rb);
++      }
++#endif
++
+ #if (CONFIG_DATA_BUFFER_SIZE) > 0
+       data = buffer_peak_head(pc->data_rb, &bytes);
+       if (data) {
+@@ -532,6 +592,8 @@
    int is_update = 0;
    Agent* agent = &pc->agent;
-
+ 
 +  memset(pc->dtls_srtp.remote_fingerprint, 0, sizeof(pc->dtls_srtp.remote_fingerprint));
 +
    while ((line = strstr(start, "\r\n"))) {
      line = strstr(start, "\r\n");
      strncpy(buf, start, line - start);
-@@ -564,8 +596,10 @@
+@@ -564,8 +626,10 @@
  
      start = line + 2;
    }
@@ -379,7 +629,7 @@
      return;
    }
  
-@@ -646,10 +680,13 @@
+@@ -646,10 +710,13 @@
  
  int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
    Agent* agent = &pc->agent;
@@ -397,7 +647,49 @@
  }
 --- a/src/peer_signaling.c
 +++ b/src/peer_signaling.c
-@@ -159,6 +159,9 @@
+@@ -15,6 +15,26 @@
+ #include "ssl_transport.h"
+ #include "utils.h"
+ 
++#ifdef ESP_PLATFORM
++#include "esp_heap_caps.h"
++
++/*
++ * cJSON builds the outgoing JSON in one contiguous buffer that it grows by
++ * doubling, so a ~2 KB SDP answer needs a 4 KB block. Measured on target, the
++ * largest free internal block once video, Wi-Fi and the model are up is 4096 B,
++ * and cJSON_PrintUnformatted() was returning NULL for every offer. Signaling
++ * payloads are control plane and never touched by DMA, so PSRAM is the right
++ * home for them; heap_caps_* memory is released with the ordinary free().
++ */
++static void* peer_signaling_json_malloc(size_t size) {
++  return heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
++}
++
++static void peer_signaling_json_free(void* ptr) {
++  free(ptr);
++}
++#endif
++
+ #define KEEP_ALIVE_TIMEOUT_SECONDS 60
+ #define CONNACK_RECV_TIMEOUT_MS 1000
+ 
+@@ -52,6 +72,14 @@
+   uint16_t packet_id;
+   int id;
+ 
++  /* Offers are built by peer_connection_loop(), which the application runs in a
++     different task from peer_signaling_loop(). Publishing from there raced with
++     MQTT_ProcessLoop() -- coreMQTT is not thread-safe, the two writers interleaved
++     TLS records and the broker silently dropped the offer while MQTT_Publish still
++     reported success. The producer now parks the payload here and the signaling
++     task, which owns the MQTT context, sends it. */
++  char* volatile pending_payload;
++
+   int proto;  // 0: MQTT, 1: HTTP
+   int port;
+   char host[HOST_MAX_LEN];
+@@ -159,6 +187,9 @@
  static void peer_signaling_on_pub_event(const char* msg, size_t size) {
    cJSON *req, *res, *item, *result, *error;
    int id = -1;
@@ -407,7 +699,7 @@
    char* payload = NULL;
    PeerConnectionState state;
  
-@@ -195,6 +198,7 @@
+@@ -195,6 +226,7 @@
          case PEER_CONNECTION_FAILED:
          case PEER_CONNECTION_CLOSED: {
            g_ps.id = id;
@@ -415,7 +707,7 @@
            peer_connection_create_offer(g_ps.pc);
          } break;
          default: {
-@@ -210,6 +214,7 @@
+@@ -210,6 +242,7 @@
        }
  
        if (state == PEER_CONNECTION_NEW) {
@@ -423,7 +715,7 @@
          peer_connection_set_remote_description(g_ps.pc, item->valuestring);
          result = cJSON_CreateString("");
        }
-@@ -229,6 +234,7 @@
+@@ -229,6 +262,7 @@
    } while (0);
  
    if (result || error) {
@@ -431,7 +723,16 @@
      res = cJSON_CreateObject();
      cJSON_AddStringToObject(res, "jsonrpc", RPC_VERSION);
      cJSON_AddNumberToObject(res, "id", id);
-@@ -476,6 +482,9 @@
+@@ -244,6 +278,8 @@
+     if (payload) {
+       peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, payload);
+       free(payload);
++    } else {
++      LOGE("failed to serialise response to id=%d -- out of memory", id);
+     }
+     cJSON_Delete(res);
+   }
+@@ -476,15 +512,27 @@
  static void peer_signaling_onicecandidate(char* description, void* userdata) {
    cJSON* res;
    char* payload;
@@ -441,15 +742,27 @@
    if (g_ps.id > 0) {
      res = cJSON_CreateObject();
      cJSON_AddStringToObject(res, "jsonrpc", RPC_VERSION);
-@@ -488,6 +497,7 @@
+     cJSON_AddNumberToObject(res, "id", g_ps.id);
+     cJSON_AddStringToObject(res, "result", description);
+     payload = cJSON_PrintUnformatted(res);
+-    if (payload) {
+-      peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, payload);
++    if (!payload) {
++      /* This used to fall through to a "publish done" log, so an out-of-memory
++         offer looked exactly like a delivered one. */
++      LOGE("failed to serialise offer (%u bytes of SDP) -- out of memory",
++           (unsigned)strlen(description));
++    } else if (g_ps.pending_payload != NULL) {
++      LOGW("previous offer still unsent, dropping this one");
+       free(payload);
++    } else {
++      /* Not published here on purpose -- see pending_payload. */
++      g_ps.pending_payload = payload;
++      LOGI("signaling onicecandidate queued elapsed=%lldms", ports_get_epoch_time() - t0);
      }
      cJSON_Delete(res);
      g_ps.id = 0;
-+    LOGI("signaling onicecandidate mqtt publish done elapsed=%lldms", ports_get_epoch_time() - t0);
-   } else {
-     if (strlen(g_ps.token) > 0) {
-       char cred[TOKEN_MAX_LEN + 10];
-@@ -497,6 +507,7 @@
+@@ -497,6 +545,7 @@
      } else {
        peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, "", description);
      }
@@ -457,6 +770,34 @@
    }
  }
  
+@@ -511,6 +560,11 @@
+     strncpy(g_ps.token, token, sizeof(g_ps.token));
+   }
+ 
++#ifdef ESP_PLATFORM
++  cJSON_Hooks hooks = {.malloc_fn = peer_signaling_json_malloc, .free_fn = peer_signaling_json_free};
++  cJSON_InitHooks(&hooks);
++#endif
++
+   g_ps.pc = pc;
+   peer_connection_onicecandidate(g_ps.pc, peer_signaling_onicecandidate);
+ 
+@@ -549,6 +603,15 @@
+ }
+ 
+ int peer_signaling_loop() {
++  char* payload = g_ps.pending_payload;
++
++  if (payload) {
++    g_ps.pending_payload = NULL;
++    LOGI("signaling publishing queued offer len=%u", (unsigned)strlen(payload));
++    peer_signaling_mqtt_publish(&g_ps.mqtt_ctx, payload);
++    free(payload);
++  }
++
+   MQTT_ProcessLoop(&g_ps.mqtt_ctx);
+   return 0;
+ }
 --- a/src/rtp.c
 +++ b/src/rtp.c
 @@ -189,7 +189,7 @@
@@ -468,3 +809,18 @@
        rtp_encoder->encode_func = rtp_encoder_encode_h264;
        break;
      case CODEC_PCMA:
+--- a/src/ssl_transport.c
++++ b/src/ssl_transport.c
+@@ -99,7 +99,11 @@
+     return -1;
+   }
+ 
+-  mbedtls_ssl_conf_read_timeout(&net_ctx->conf, CONFIG_TLS_READ_TIMEOUT);
++  /* Not CONFIG_TLS_READ_TIMEOUT: that constant is also used as a retry *count* in
++     peer_connection_dtls_srtp_recv(), so it cannot be lowered without shortening
++     the DTLS handshake budget. This one bounds how long peer_signaling_loop()
++     sits in select() while an offer waits in pending_payload. */
++  mbedtls_ssl_conf_read_timeout(&net_ctx->conf, CONFIG_MQTT_READ_TIMEOUT);
+   mbedtls_ssl_set_bio(&net_ctx->ssl, &net_ctx->tcp_socket,
+                       ssl_transport_mbedlts_send, NULL, ssl_transport_mbedtls_recv_timeout);
+ 

@@ -13,3 +13,25 @@ dependencies:
     version: "^0.0.3"
   espressif/esp_wifi_remote:
     version: "1.6.1"
+    # Only pulled in for Wi-Fi builds. It drags in esp_hosted, whose initialiser
+    # is a global constructor: it starts four SDIO tasks at priority 23 -- above
+    # every application task -- and claims internal DMA RAM before app_main, and
+    # it does all of that even when CONFIG_ESP_HOSTED_ENABLED is off, because
+    # that symbol only gates the driver's own features, not whether the component
+    # is linked. On an Ethernet build that cost ~21 KB of internal RAM and left
+    # the largest free block at 221184 B, below what the esp-dl model needs in
+    # one piece, so PedestrianDetect died with std::bad_alloc in
+    # FbsModel::topological_sort(). Keeping the dependency conditional is the
+    # only way to actually leave it out.
+    rules:
+      - if: "$CONFIG{APP_NETIF_WIFI} == True"
+  # Pinned, and pinned deliberately. esp_wifi_remote requires esp_hosted with an
+  # open range, so any re-resolution silently upgrades it -- editing this file was
+  # enough to jump 2.12.6 -> 3.0.6, a different internal layout, in the middle of
+  # a measurement campaign. Every Wi-Fi vs Ethernet number on record was taken on
+  # 2.12.6. Moving to 3.x is worth doing, but as its own change with its own
+  # before/after, not as a side effect of touching something else.
+  espressif/esp_hosted:
+    version: "2.12.6"
+    rules:
+      - if: "$CONFIG{APP_NETIF_WIFI} == True"

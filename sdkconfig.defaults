@@ -1,5 +1,17 @@
 CONFIG_IDF_TARGET="esp32p4"
+
+# Chip on this board reads as ESP32-P4 rev v1.3 (esptool chip_id). Rev <3.0 and
+# >=3.0 are mutually exclusive in IDF, and the rev-<3.0 line is what boots here:
+# it caps CPU at 360 MHz and PSRAM at 200 MHz (250 MHz needs rev >=3.0 silicon).
+# Both symbols must be pinned: IDF 5.5 defaults to the rev >=3.1 line, so a
+# fullclean without them regenerates a binary the bootloader refuses to start.
+# Min rev must stay <= v1.3, and above v0.0: ESP32P4_REV_MIN_0 is what forces
+# flash down to 40 MHz (spi_flash/esp32p4/Kconfig.flash_freq).
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_SPIRAM=y
 CONFIG_CACHE_L2_CACHE_256KB=y
@@ -30,3 +42,18 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
 CONFIG_MBEDTLS_SSL_DTLS_SRTP=y
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# NOTE: SPIRAM_USE_MALLOC was tried here to get libpeer's 25 KB PeerConnection out
+# of internal RAM, but it is a project-wide allocator change and we have no
+# measurement of streaming without it. patches/sepfy__libpeer.patch now asks for
+# PSRAM at that one call site instead, so the rest of the system allocates exactly
+# as it always did.
+
+# EMAC DMA buffers, for CONFIG_APP_NETIF_ETH builds. They come out of internal
+# RAM, which is the scarce resource on this board: the esp-dl model needs a
+# ~220 KB contiguous internal block, and with the stock 20 RX / 10 TX x 512 B the
+# largest free block fell to 221184 B and PedestrianDetect died with
+# std::bad_alloc. This stream is ~1.5 Mbps, so half the buffers are ample.
+# Harmless on Wi-Fi builds, where the EMAC driver is not compiled in.
+CONFIG_ETH_DMA_RX_BUFFER_NUM=10
+CONFIG_ETH_DMA_TX_BUFFER_NUM=6

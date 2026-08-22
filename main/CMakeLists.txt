@@ -2,11 +2,23 @@
 #   hal/  thin wrappers over IDF drivers and components, no app policy
 #   core/ app services shared by tasks, no FreeRTOS task ownership
 #   task/ one FreeRTOS task per file
+set(priv_requires esp_netif esp_video
+                  esp_timer esp_driver_ppa esp_driver_i2s esp_driver_i2c
+                  esp_mm esp-dl pedestrian_detect esp_codec_dev libpeer)
+
+# hal_netif.c already includes esp_eth.h / esp_wifi.h under the matching #if, so
+# the requirement follows it. Listing both unconditionally made MINIMAL_BUILD
+# compile the whole esp_eth driver into every Wi-Fi build (12 objects the linker
+# then discards whole, since nothing references them).
+if(CONFIG_APP_NETIF_ETH)
+    list(APPEND priv_requires esp_eth)
+else()
+    list(APPEND priv_requires esp_wifi)
+endif()
+
 idf_component_register(SRC_DIRS "." "hal" "core" "task"
                        INCLUDE_DIRS "." "hal" "core" "task"
-                       PRIV_REQUIRES esp_netif esp_eth esp_wifi esp_video
-                                     esp_timer esp_driver_ppa esp_driver_i2s esp_driver_i2c
-                                     esp_mm esp-dl pedestrian_detect esp_codec_dev libpeer)
+                       PRIV_REQUIRES ${priv_requires})
 
 # libpeer keeps its tunables in its own src/config.h, every one behind #ifndef.
 # Force-including core/libpeer_config.h ahead of it makes our definitions win, so

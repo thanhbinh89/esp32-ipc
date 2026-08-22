@@ -1,7 +1,6 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_cpu.h"
 #include "sdkconfig.h"
@@ -16,7 +15,6 @@ static const char *TAG = "webrtc";
 /* Private to this file — reachable only through the webrtc_* functions below. */
 static PeerConnection *s_pc = nullptr;
 static PeerConnectionState s_state = PEER_CONNECTION_CLOSED;
-static SemaphoreHandle_t s_pc_lock = nullptr;
 
 static bool s_datachannel_open = false;
 static volatile bool s_keyframe_requested = false;
@@ -58,37 +56,50 @@ bool webrtc_is_streaming(void) {
     return s_pc && s_state == PEER_CONNECTION_COMPLETED;
 }
 
-/* Shared body of the two senders: gate on state, take the lock, hand off. */
+/*
+ * Shared body of the two senders: gate on state, hand off.
+ *
+ * Deliberately unlocked. Both of these only push into a per-stream ring buffer
+ * (peer_connection.c hands them straight to buffer_push_tail); the RTP
+ * fragmenting, SRTP encryption and UDP transmit all happen later, inside
+ * peer_connection_loop(). Each ring has exactly one producer -- video here, audio
+ * from the audio task -- and one consumer, that loop, so the ring is
+ * single-producer/single-consumer and safe without mutual exclusion; buffer.c
+ * carries the barriers that make the handover ordered.
+ *
+ * Serialising these against the loop meant a frame could not even be memcpy'd
+ * while the previous one was being transmitted, and a 1080p IDR is 40-odd UDP
+ * sends over SDIO. Measured on target: 43% of frames were dropped after a full
+ * 37 ms encode, and because libpeer steps the RTP timestamp once per frame it
+ * actually sends, those drops skewed the receiver's timeline exactly the way
+ * over-feeding the encoder did.
+ */
 static int webrtc_send(int (*send)(PeerConnection *, const uint8_t *, size_t),
-                       const uint8_t *buf, size_t len, uint32_t timeout_ms) {
+                       const uint8_t *buf, size_t len) {
     if (!webrtc_is_streaming() || len == 0) {
         return 0;
     }
-    if (xSemaphoreTake(s_pc_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        return -1;
-    }
 
     int ret = send(s_pc, buf, len);
-    xSemaphoreGive(s_pc_lock);
 
     return ret < 0 ? ret : (int)len;
 }
 
-int webrtc_send_video(const uint8_t *buf, size_t len, uint32_t timeout_ms) {
-    return webrtc_send(peer_connection_send_video, buf, len, timeout_ms);
+int webrtc_send_video(const uint8_t *buf, size_t len) {
+    return webrtc_send(peer_connection_send_video, buf, len);
 }
 
-int webrtc_send_audio(const uint8_t *buf, size_t len, uint32_t timeout_ms) {
-    return webrtc_send(peer_connection_send_audio, buf, len, timeout_ms);
+int webrtc_send_audio(const uint8_t *buf, size_t len) {
+    return webrtc_send(peer_connection_send_audio, buf, len);
 }
 
 static void peer_connection_task(void *arg) {
     while (true) {
-        if (xSemaphoreTake(s_pc_lock, portMAX_DELAY) == pdTRUE) {
-            peer_connection_loop(s_pc);
-            xSemaphoreGive(s_pc_lock);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        peer_connection_loop(s_pc);
+        /* Only back off once ICE has finished -- see WEBRTC_PEER_ICE_LOOP_MS for
+         * why libpeer's connectivity checks cannot survive a slower loop. */
+        vTaskDelay(pdMS_TO_TICKS(webrtc_is_streaming() ? WEBRTC_PEER_LOOP_MS
+                                                       : WEBRTC_PEER_ICE_LOOP_MS));
     }
 }
 
@@ -108,13 +119,6 @@ void task_webrtc(void *arg) {
     cfg.datachannel = DATA_CHANNEL_BINARY;
     cfg.on_request_keyframe = on_request_keyframe;
 
-    s_pc_lock = xSemaphoreCreateMutex();
-    if (!s_pc_lock) {
-        ESP_LOGE(TAG, "mutex alloc failed");
-        vTaskDelete(NULL);
-        return;
-    }
-
     peer_init();
     s_pc = peer_connection_create(&cfg);
     if (!s_pc) {
@@ -131,7 +135,7 @@ void task_webrtc(void *arg) {
     ESP_LOGI(TAG, "signaling URL: %s", CONFIG_SIGNALING_URL);
 
     if (xTaskCreatePinnedToCore(peer_connection_task, "peer", TASK_PEER_STACK_SIZE, NULL,
-                                TASK_PRIO_PEER, NULL, TASK_CORE_NET) != pdPASS) {
+                                TASK_PRIO_PEER, NULL, TASK_CORE_PEER) != pdPASS) {
         ESP_LOGE(TAG, "peer_connection task create failed");
         peer_connection_destroy(s_pc);
         peer_deinit();

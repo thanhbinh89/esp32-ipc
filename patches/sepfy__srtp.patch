@@ -1,8 +1,576 @@
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -114,3 +114,5 @@
+@@ -19,9 +19,12 @@
+     libsrtp/crypto/cipher/aes_gcm_ossl.c
+   )
+ else()
++  # aes_icm_mbedtls.c stands in for aes_icm.c so AES-CTR runs on the ESP32 AES
++  # peripheral. aes.c stays: ekt.c calls srtp_aes_decrypt() directly and is the
++  # only remaining user of the software block primitive.
+   list(APPEND  CIPHERS_SOURCES_C
+     libsrtp/crypto/cipher/aes.c
+-    libsrtp/crypto/cipher/aes_icm.c
++    libsrtp/crypto/cipher/aes_icm_mbedtls.c
+   )
+ endif()
+ 
+@@ -37,9 +40,10 @@
+     libsrtp/crypto/hash/hmac_ossl.c
+   )
+ else()
++  # hmac_mbedtls.c replaces hmac.c and sha1.c together, so HMAC-SHA1 runs on the
++  # ESP32 SHA peripheral. Nothing else in this build calls srtp_sha1_*.
+   list(APPEND  HASHES_SOURCES_C
+-    libsrtp/crypto/hash/hmac.c
+-    libsrtp/crypto/hash/sha1.c
++    libsrtp/crypto/hash/hmac_mbedtls.c
+   )
+ endif()
+ 
+@@ -110,7 +114,10 @@
+ 	)
+ 
+ 
+-idf_component_register(SRCS ${SRTP2_SRCS} INCLUDE_DIRS ${SRTP2_INCLUDE_DIRS})
++idf_component_register(SRCS ${SRTP2_SRCS} INCLUDE_DIRS ${SRTP2_INCLUDE_DIRS}
++                       PRIV_REQUIRES mbedtls)
  target_compile_definitions(${COMPONENT_LIB} PUBLIC "-DHAVE_CONFIG_H")
  #  OUCH!  Fix a false positive in crypto_kernel.c to prevent an error during a debug build.
  set_source_files_properties(libsrtp/crypto/kernel/crypto_kernel.c PROPERTIES COMPILE_FLAGS -Wno-maybe-uninitialized)
 +# uint32_t vs unsigned int pointer type mismatch on RISC-V (ESP32-P4) where uint32_t = unsigned long.
 +target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=incompatible-pointer-types -Wno-incompatible-pointer-types)
+--- a/libsrtp/crypto/cipher/aes_icm_mbedtls.c
++++ b/libsrtp/crypto/cipher/aes_icm_mbedtls.c
+@@ -0,0 +1,309 @@
++/*
++ * aes_icm_mbedtls.c
++ *
++ * AES integer counter mode backed by mbedTLS, so the ESP32 AES peripheral does
++ * the work instead of the table-driven C implementation in aes.c.
++ *
++ * This replaces aes_icm.c, not aes.c: ekt.c still calls srtp_aes_decrypt()
++ * directly, so the software primitive stays in the build for it.
++ *
++ * Why mbedTLS CTR rather than swapping the block primitive underneath
++ * aes_icm.c: on ESP-IDF every mbedtls_aes_* call takes the AES peripheral lock
++ * and enables the peripheral, so a per-16-byte-block call would pay that
++ * overhead ~82 times for a 1300 byte packet and end up slower than software.
++ * mbedtls_aes_crypt_ctr() runs the whole packet under one acquisition.
++ *
++ * Counter arithmetic: SRTP ICM defines a 16-bit block counter in the low two
++ * octets, while mbedtls_aes_crypt_ctr() increments the full 128-bit block as a
++ * big-endian integer. The two agree as long as the counter does not carry out
++ * of those two octets, i.e. for anything under 65536 blocks (1 MB) per IV.
++ * srtp_aes_icm_mbedtls_context_init() zeroes the low two octets, and an RTP
++ * packet is three orders of magnitude below that bound.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++/* err.h first: it defines srtp_debug_module_t, which cipher_types.h uses. */
++#include "err.h"
++
++#include "aes.h"
++#include "alloc.h"
++#include "cipher.h"
++#include "cipher_types.h"
++
++#include "mbedtls/aes.h"
++
++typedef struct {
++    v128_t counter;         /* current counter block, consumed by mbedTLS  */
++    v128_t offset;          /* salt, XORed with the IV to make the counter */
++    mbedtls_aes_context aes;
++    uint8_t stream_block[16]; /* mbedTLS keystream remainder across calls  */
++    size_t nc_off;            /* offset into stream_block                  */
++    int key_size;             /* AES key size, without the 14 byte salt    */
++} srtp_aes_icm_mbedtls_ctx_t;
++
++srtp_debug_module_t srtp_mod_aes_icm = {
++    0,                 /* debugging is off by default */
++    "aes icm mbedtls" /* printable module name       */
++};
++
++extern const srtp_cipher_type_t srtp_aes_icm_128;
++extern const srtp_cipher_type_t srtp_aes_icm_256;
++
++static srtp_err_status_t srtp_aes_icm_mbedtls_alloc(srtp_cipher_t **c,
++                                                    int key_len,
++                                                    int tlen)
++{
++    srtp_aes_icm_mbedtls_ctx_t *icm;
++
++    (void)tlen;
++
++    if (key_len != SRTP_AES_ICM_128_KEY_LEN_WSALT &&
++        key_len != SRTP_AES_ICM_256_KEY_LEN_WSALT) {
++        return srtp_err_status_bad_param;
++    }
++
++    *c = (srtp_cipher_t *)srtp_crypto_alloc(sizeof(srtp_cipher_t));
++    if (*c == NULL) {
++        return srtp_err_status_alloc_fail;
++    }
++
++    icm = (srtp_aes_icm_mbedtls_ctx_t *)srtp_crypto_alloc(
++        sizeof(srtp_aes_icm_mbedtls_ctx_t));
++    if (icm == NULL) {
++        srtp_crypto_free(*c);
++        *c = NULL;
++        return srtp_err_status_alloc_fail;
++    }
++
++    mbedtls_aes_init(&icm->aes);
++
++    (*c)->state = icm;
++
++    switch (key_len) {
++    case SRTP_AES_ICM_256_KEY_LEN_WSALT:
++        (*c)->algorithm = SRTP_AES_ICM_256;
++        (*c)->type = &srtp_aes_icm_256;
++        icm->key_size = SRTP_AES_256_KEY_LEN;
++        break;
++    default:
++        (*c)->algorithm = SRTP_AES_ICM_128;
++        (*c)->type = &srtp_aes_icm_128;
++        icm->key_size = SRTP_AES_128_KEY_LEN;
++        break;
++    }
++
++    (*c)->key_len = key_len;
++
++    return srtp_err_status_ok;
++}
++
++static srtp_err_status_t srtp_aes_icm_mbedtls_dealloc(srtp_cipher_t *c)
++{
++    srtp_aes_icm_mbedtls_ctx_t *ctx;
++
++    if (c == NULL) {
++        return srtp_err_status_bad_param;
++    }
++
++    ctx = (srtp_aes_icm_mbedtls_ctx_t *)c->state;
++    if (ctx) {
++        mbedtls_aes_free(&ctx->aes);
++        octet_string_set_to_zero(ctx, sizeof(srtp_aes_icm_mbedtls_ctx_t));
++        srtp_crypto_free(ctx);
++    }
++
++    srtp_crypto_free(c);
++
++    return srtp_err_status_ok;
++}
++
++/*
++ * The key buffer holds key_size octets of key followed by SRTP_SALT_LEN octets
++ * of salt. The salt becomes the counter's fixed part; the low two octets are
++ * the block counter and must start at zero.
++ */
++static srtp_err_status_t srtp_aes_icm_mbedtls_context_init(void *cv,
++                                                           const uint8_t *key)
++{
++    srtp_aes_icm_mbedtls_ctx_t *c = (srtp_aes_icm_mbedtls_ctx_t *)cv;
++
++    v128_set_to_zero(&c->counter);
++    v128_set_to_zero(&c->offset);
++    memcpy(&c->counter, key + c->key_size, SRTP_SALT_LEN);
++    memcpy(&c->offset, key + c->key_size, SRTP_SALT_LEN);
++
++    c->offset.v8[SRTP_SALT_LEN] = c->offset.v8[SRTP_SALT_LEN + 1] = 0;
++    c->counter.v8[SRTP_SALT_LEN] = c->counter.v8[SRTP_SALT_LEN + 1] = 0;
++
++    c->nc_off = 0;
++    memset(c->stream_block, 0, sizeof(c->stream_block));
++
++    if (mbedtls_aes_setkey_enc(&c->aes, key, c->key_size * 8) != 0) {
++        return srtp_err_status_cipher_fail;
++    }
++
++    return srtp_err_status_ok;
++}
++
++static srtp_err_status_t srtp_aes_icm_mbedtls_set_iv(void *cv,
++                                                     uint8_t *iv,
++                                                     srtp_cipher_direction_t dir)
++{
++    srtp_aes_icm_mbedtls_ctx_t *c = (srtp_aes_icm_mbedtls_ctx_t *)cv;
++    v128_t nonce;
++
++    (void)dir; /* CTR keystream is the same in both directions */
++
++    v128_copy_octet_string(&nonce, iv);
++    v128_xor(&c->counter, &c->offset, &nonce);
++
++    /* Start a fresh keystream: nothing carries over between packets. */
++    c->nc_off = 0;
++    memset(c->stream_block, 0, sizeof(c->stream_block));
++
++    return srtp_err_status_ok;
++}
++
++static srtp_err_status_t srtp_aes_icm_mbedtls_encrypt(void *cv,
++                                                      unsigned char *buf,
++                                                      unsigned int *enc_len)
++{
++    srtp_aes_icm_mbedtls_ctx_t *c = (srtp_aes_icm_mbedtls_ctx_t *)cv;
++
++    if (mbedtls_aes_crypt_ctr(&c->aes, *enc_len, &c->nc_off, c->counter.v8,
++                              c->stream_block, buf, buf) != 0) {
++        return srtp_err_status_cipher_fail;
++    }
++
++    return srtp_err_status_ok;
++}
++
++static const char srtp_aes_icm_128_mbedtls_description[] =
++    "AES-128 counter mode using mbedtls";
++static const char srtp_aes_icm_256_mbedtls_description[] =
++    "AES-256 counter mode using mbedtls";
++
++/*
++ * The test vectors are the ones aes_icm.c ships with; srtp_crypto_kernel_init()
++ * runs them at startup, so a mismatch between this backend and the software one
++ * fails loudly at boot rather than as undecodable media.
++ */
++
++/* clang-format off */
++static const uint8_t srtp_aes_icm_128_test_case_0_key[SRTP_AES_ICM_128_KEY_LEN_WSALT] = {
++    0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
++    0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
++    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
++    0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd
++};
++
++static uint8_t srtp_aes_icm_128_test_case_0_nonce[16] = {
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++};
++
++static const uint8_t srtp_aes_icm_128_test_case_0_plaintext[32] =  {
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++};
++
++static const uint8_t srtp_aes_icm_128_test_case_0_ciphertext[32] = {
++    0xe0, 0x3e, 0xad, 0x09, 0x35, 0xc9, 0x5e, 0x80,
++    0xe1, 0x66, 0xb1, 0x6d, 0xd9, 0x2b, 0x4e, 0xb4,
++    0xd2, 0x35, 0x13, 0x16, 0x2b, 0x02, 0xd0, 0xf7,
++    0x2a, 0x43, 0xa2, 0xfe, 0x4a, 0x5f, 0x97, 0xab
++};
++/* clang-format on */
++
++static const srtp_cipher_test_case_t srtp_aes_icm_128_test_case_0 = {
++    SRTP_AES_ICM_128_KEY_LEN_WSALT,          /* octets in key            */
++    srtp_aes_icm_128_test_case_0_key,        /* key                      */
++    srtp_aes_icm_128_test_case_0_nonce,      /* packet index             */
++    32,                                      /* octets in plaintext      */
++    srtp_aes_icm_128_test_case_0_plaintext,  /* plaintext                */
++    32,                                      /* octets in ciphertext     */
++    srtp_aes_icm_128_test_case_0_ciphertext, /* ciphertext               */
++    0,                                       /* */
++    NULL,                                    /* */
++    0,                                       /* */
++    NULL                                     /* pointer to next testcase */
++};
++
++/* clang-format off */
++static const uint8_t srtp_aes_icm_256_test_case_0_key[SRTP_AES_ICM_256_KEY_LEN_WSALT] = {
++    0x57, 0xf8, 0x2f, 0xe3, 0x61, 0x3f, 0xd1, 0x70,
++    0xa8, 0x5e, 0xc9, 0x3c, 0x40, 0xb1, 0xf0, 0x92,
++    0x2e, 0xc4, 0xcb, 0x0d, 0xc0, 0x25, 0xb5, 0x82,
++    0x72, 0x14, 0x7c, 0xc4, 0x38, 0x94, 0x4a, 0x98,
++    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
++    0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd
++};
++
++static uint8_t srtp_aes_icm_256_test_case_0_nonce[16] = {
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++};
++
++static const uint8_t srtp_aes_icm_256_test_case_0_plaintext[32] =  {
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++};
++
++static const uint8_t srtp_aes_icm_256_test_case_0_ciphertext[32] = {
++    0x92, 0xbd, 0xd2, 0x8a, 0x93, 0xc3, 0xf5, 0x25,
++    0x11, 0xc6, 0x77, 0xd0, 0x8b, 0x55, 0x15, 0xa4,
++    0x9d, 0xa7, 0x1b, 0x23, 0x78, 0xa8, 0x54, 0xf6,
++    0x70, 0x50, 0x75, 0x6d, 0xed, 0x16, 0x5b, 0xac
++};
++/* clang-format on */
++
++static const srtp_cipher_test_case_t srtp_aes_icm_256_test_case_0 = {
++    SRTP_AES_ICM_256_KEY_LEN_WSALT,          /* octets in key            */
++    srtp_aes_icm_256_test_case_0_key,        /* key                      */
++    srtp_aes_icm_256_test_case_0_nonce,      /* packet index             */
++    32,                                      /* octets in plaintext      */
++    srtp_aes_icm_256_test_case_0_plaintext,  /* plaintext                */
++    32,                                      /* octets in ciphertext     */
++    srtp_aes_icm_256_test_case_0_ciphertext, /* ciphertext               */
++    0,                                       /* */
++    NULL,                                    /* */
++    0,                                       /* */
++    NULL                                     /* pointer to next testcase */
++};
++
++/* note: the encrypt function is identical to the decrypt function */
++
++const srtp_cipher_type_t srtp_aes_icm_128 = {
++    srtp_aes_icm_mbedtls_alloc,           /* */
++    srtp_aes_icm_mbedtls_dealloc,         /* */
++    srtp_aes_icm_mbedtls_context_init,    /* */
++    0,                                    /* set_aad */
++    srtp_aes_icm_mbedtls_encrypt,         /* */
++    srtp_aes_icm_mbedtls_encrypt,         /* */
++    srtp_aes_icm_mbedtls_set_iv,          /* */
++    0,                                    /* get_tag */
++    srtp_aes_icm_128_mbedtls_description, /* */
++    &srtp_aes_icm_128_test_case_0,        /* */
++    SRTP_AES_ICM_128                      /* */
++};
++
++const srtp_cipher_type_t srtp_aes_icm_256 = {
++    srtp_aes_icm_mbedtls_alloc,           /* */
++    srtp_aes_icm_mbedtls_dealloc,         /* */
++    srtp_aes_icm_mbedtls_context_init,    /* */
++    0,                                    /* set_aad */
++    srtp_aes_icm_mbedtls_encrypt,         /* */
++    srtp_aes_icm_mbedtls_encrypt,         /* */
++    srtp_aes_icm_mbedtls_set_iv,          /* */
++    0,                                    /* get_tag */
++    srtp_aes_icm_256_mbedtls_description, /* */
++    &srtp_aes_icm_256_test_case_0,        /* */
++    SRTP_AES_ICM_256                      /* */
++};
+--- a/libsrtp/crypto/hash/hmac_mbedtls.c
++++ b/libsrtp/crypto/hash/hmac_mbedtls.c
+@@ -0,0 +1,220 @@
++/*
++ * hmac_mbedtls.c
++ *
++ * HMAC-SHA1 backed by mbedTLS, so the ESP32 SHA peripheral does the work
++ * instead of the C implementation in sha1.c. Replaces hmac.c and sha1.c
++ * together: nothing else in the build calls srtp_sha1_*.
++ *
++ * The one structural difference from hmac.c is how a tag is restarted. That
++ * version keeps two srtp_sha1_ctx_t and memcpy()s the primed one over the
++ * working one for each packet. A hardware-backed context cannot be copied like
++ * that -- on ESP-IDF it holds peripheral state and is locked between the first
++ * update and the finish -- so this uses mbedtls_md_hmac_reset(), which is the
++ * same idea expressed through the API.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++/* err.h first: it defines srtp_debug_module_t, which cipher_types.h uses. */
++#include "err.h"
++
++#include "alloc.h"
++#include "auth.h"
++#include "cipher_types.h"
++
++#include "mbedtls/md.h"
++
++typedef struct {
++    mbedtls_md_context_t md;
++} srtp_hmac_mbedtls_ctx_t;
++
++srtp_debug_module_t srtp_mod_hmac = {
++    0,                  /* debugging is off by default */
++    "hmac sha-1 mbedtls" /* printable name for module   */
++};
++
++extern const srtp_auth_type_t srtp_hmac;
++
++static srtp_err_status_t srtp_hmac_mbedtls_alloc(srtp_auth_t **a,
++                                                 int key_len,
++                                                 int out_len)
++{
++    uint8_t *pointer;
++    srtp_hmac_mbedtls_ctx_t *state;
++    const mbedtls_md_info_t *info;
++
++    /* Same limits as the software version: SHA-1 block key, SHA-1 sized tag. */
++    if (key_len > 20) {
++        return srtp_err_status_bad_param;
++    }
++    if (out_len > 20) {
++        return srtp_err_status_bad_param;
++    }
++
++    pointer = (uint8_t *)srtp_crypto_alloc(sizeof(srtp_hmac_mbedtls_ctx_t) +
++                                           sizeof(srtp_auth_t));
++    if (pointer == NULL) {
++        return srtp_err_status_alloc_fail;
++    }
++
++    *a = (srtp_auth_t *)pointer;
++    (*a)->type = &srtp_hmac;
++    (*a)->state = pointer + sizeof(srtp_auth_t);
++    (*a)->out_len = out_len;
++    (*a)->key_len = key_len;
++    (*a)->prefix_len = 0;
++
++    state = (srtp_hmac_mbedtls_ctx_t *)(*a)->state;
++    mbedtls_md_init(&state->md);
++
++    info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
++    if (info == NULL) {
++        srtp_crypto_free(pointer);
++        *a = NULL;
++        return srtp_err_status_algo_fail;
++    }
++
++    /* 1 = allocate the HMAC ipad/opad buffers alongside the digest context */
++    if (mbedtls_md_setup(&state->md, info, 1) != 0) {
++        mbedtls_md_free(&state->md);
++        srtp_crypto_free(pointer);
++        *a = NULL;
++        return srtp_err_status_alloc_fail;
++    }
++
++    return srtp_err_status_ok;
++}
++
++static srtp_err_status_t srtp_hmac_mbedtls_dealloc(srtp_auth_t *a)
++{
++    srtp_hmac_mbedtls_ctx_t *state = (srtp_hmac_mbedtls_ctx_t *)a->state;
++
++    mbedtls_md_free(&state->md);
++
++    octet_string_set_to_zero(a, sizeof(srtp_hmac_mbedtls_ctx_t) +
++                                    sizeof(srtp_auth_t));
++    srtp_crypto_free(a);
++
++    return srtp_err_status_ok;
++}
++
++static srtp_err_status_t srtp_hmac_mbedtls_init(void *statev,
++                                                const uint8_t *key,
++                                                int key_len)
++{
++    srtp_hmac_mbedtls_ctx_t *state = (srtp_hmac_mbedtls_ctx_t *)statev;
++
++    if (key_len > 20) {
++        return srtp_err_status_bad_param;
++    }
++
++    if (mbedtls_md_hmac_starts(&state->md, key, (size_t)key_len) != 0) {
++        return srtp_err_status_auth_fail;
++    }
++
++    return srtp_err_status_ok;
++}
++
++static srtp_err_status_t srtp_hmac_mbedtls_start(void *statev)
++{
++    srtp_hmac_mbedtls_ctx_t *state = (srtp_hmac_mbedtls_ctx_t *)statev;
++
++    if (mbedtls_md_hmac_reset(&state->md) != 0) {
++        return srtp_err_status_auth_fail;
++    }
++
++    return srtp_err_status_ok;
++}
++
++static srtp_err_status_t srtp_hmac_mbedtls_update(void *statev,
++                                                  const uint8_t *message,
++                                                  int msg_octets)
++{
++    srtp_hmac_mbedtls_ctx_t *state = (srtp_hmac_mbedtls_ctx_t *)statev;
++
++    if (mbedtls_md_hmac_update(&state->md, message, (size_t)msg_octets) != 0) {
++        return srtp_err_status_auth_fail;
++    }
++
++    return srtp_err_status_ok;
++}
++
++static srtp_err_status_t srtp_hmac_mbedtls_compute(void *statev,
++                                                   const uint8_t *message,
++                                                   int msg_octets,
++                                                   int tag_len,
++                                                   uint8_t *result)
++{
++    srtp_hmac_mbedtls_ctx_t *state = (srtp_hmac_mbedtls_ctx_t *)statev;
++    uint8_t hash_value[20];
++    int i;
++
++    if (tag_len > 20) {
++        return srtp_err_status_bad_param;
++    }
++
++    if (mbedtls_md_hmac_update(&state->md, message, (size_t)msg_octets) != 0) {
++        return srtp_err_status_auth_fail;
++    }
++    if (mbedtls_md_hmac_finish(&state->md, hash_value) != 0) {
++        return srtp_err_status_auth_fail;
++    }
++
++    /* SRTP truncates the tag; callers ask for 4 or 10 of the 20 octets. */
++    for (i = 0; i < tag_len; i++) {
++        result[i] = hash_value[i];
++    }
++
++    /* Leave the context primed so the next start() is just a reset. */
++    if (mbedtls_md_hmac_reset(&state->md) != 0) {
++        return srtp_err_status_auth_fail;
++    }
++
++    return srtp_err_status_ok;
++}
++
++/* RFC 2202 test case 1, the same vector hmac.c carries. */
++/* clang-format off */
++static const uint8_t srtp_hmac_test_case_0_key[20] = {
++    0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
++    0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
++    0x0b, 0x0b, 0x0b, 0x0b
++};
++
++static const uint8_t srtp_hmac_test_case_0_data[8] = {
++    0x48, 0x69, 0x20, 0x54, 0x68, 0x65, 0x72, 0x65 /* "Hi There" */
++};
++
++static const uint8_t srtp_hmac_test_case_0_tag[20] = {
++    0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64,
++    0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37, 0x8c, 0x8e,
++    0xf1, 0x46, 0xbe, 0x00
++};
++/* clang-format on */
++
++static const srtp_auth_test_case_t srtp_hmac_test_case_0 = {
++    20,                         /* octets in key            */
++    srtp_hmac_test_case_0_key,  /* key                      */
++    8,                          /* octets in data           */
++    srtp_hmac_test_case_0_data, /* data                     */
++    20,                         /* octets in tag            */
++    srtp_hmac_test_case_0_tag,  /* tag                      */
++    NULL                        /* pointer to next testcase */
++};
++
++static const char srtp_hmac_description[] =
++    "hmac sha-1 authentication function using mbedtls";
++
++const srtp_auth_type_t srtp_hmac = {
++    srtp_hmac_mbedtls_alloc,   /* */
++    srtp_hmac_mbedtls_dealloc, /* */
++    srtp_hmac_mbedtls_init,    /* */
++    srtp_hmac_mbedtls_compute, /* */
++    srtp_hmac_mbedtls_update,  /* */
++    srtp_hmac_mbedtls_start,   /* */
++    srtp_hmac_description,     /* */
++    &srtp_hmac_test_case_0,    /* */
++    SRTP_HMAC_SHA1             /* */
++};

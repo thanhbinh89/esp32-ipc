@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <string.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -5,7 +6,9 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_video_device.h"
+#include "esp_video_ioctl.h"
 
 #include "hal_h264_encoder.h"
 
@@ -36,6 +39,15 @@ esp_err_t hal_h264_open(hal_h264_t *enc, const hal_h264_cfg_t *cfg) {
     enc->fd = open(ESP_VIDEO_H264_DEVICE_NAME, O_RDONLY);
     ESP_RETURN_ON_FALSE(enc->fd >= 0, ESP_FAIL, TAG, "open %s failed", ESP_VIDEO_H264_DEVICE_NAME);
 
+    /* Same reason as the capture device: never wait forever on hardware. */
+    struct timeval dqbuf_timeout = {
+        .tv_sec = VIDEO_DQBUF_TIMEOUT_MS / 1000,
+        .tv_usec = (VIDEO_DQBUF_TIMEOUT_MS % 1000) * 1000,
+    };
+    if (ioctl(enc->fd, VIDIOC_S_DQBUF_TIMEOUT, &dqbuf_timeout) != 0) {
+        ESP_LOGW(TAG, "DQBUF timeout not settable; an encoder stall will hang this task");
+    }
+
     set_ctrl(enc->fd, V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, cfg->i_period, "I period");
     set_ctrl(enc->fd, V4L2_CID_MPEG_VIDEO_BITRATE, cfg->bitrate, "bitrate");
     set_ctrl(enc->fd, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, cfg->min_qp, "min QP");
@@ -61,6 +73,9 @@ esp_err_t hal_h264_open(hal_h264_t *enc, const hal_h264_cfg_t *cfg) {
     format.fmt.pix.width = cfg->width;
     format.fmt.pix.height = cfg->height;
     format.fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
+    /* Without this the driver sizes each bitstream buffer at width*height*bpp/8
+     * with bpp=8 -- 2 MB for 1080p. See H264_MAX_FRAME_BYTES. */
+    format.fmt.pix.sizeimage = H264_MAX_FRAME_BYTES;
     ESP_RETURN_ON_FALSE(ioctl(enc->fd, VIDIOC_S_FMT, &format) == 0, ESP_FAIL, TAG, "S_FMT capture failed");
 
     memset(&req, 0, sizeof(req));
@@ -81,12 +96,16 @@ esp_err_t hal_h264_open(hal_h264_t *enc, const hal_h264_cfg_t *cfg) {
         ESP_RETURN_ON_FALSE(enc->out_mmap[i], ESP_ERR_NO_MEM, TAG, "mmap %d failed", i);
 
         ESP_RETURN_ON_FALSE(ioctl(enc->fd, VIDIOC_QBUF, &buf) == 0, ESP_FAIL, TAG, "QBUF %d failed", i);
+        enc->out_length = buf.length;
     }
 
-    ESP_LOGI(TAG, "%s: %ux%u, I period %d, %d bps, QP %d-%d, %d bitstream buffers",
+    /* Print what the driver actually gave us, not what we asked for: it is free
+     * to round sizeimage up, and this is the number to compare against a
+     * "bad frame" log if one ever appears. */
+    ESP_LOGI(TAG, "%s: %ux%u, I period %d, %d bps, QP %d-%d, %d bitstream buffer(s) of %u B",
              ESP_VIDEO_H264_DEVICE_NAME, (unsigned)cfg->width, (unsigned)cfg->height,
              (int)cfg->i_period, (int)cfg->bitrate, (int)cfg->min_qp, (int)cfg->max_qp,
-             ENC_OUT_BUF_COUNT);
+             ENC_OUT_BUF_COUNT, (unsigned)enc->out_length);
     return ESP_OK;
 }
 
@@ -111,13 +130,39 @@ esp_err_t hal_h264_encode(hal_h264_t *enc, uint8_t *yuv420, size_t len,
     memset(out, 0, sizeof(*out));
     out->buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     out->buf.memory = V4L2_MEMORY_MMAP;
-    ESP_RETURN_ON_FALSE(ioctl(enc->fd, VIDIOC_DQBUF, &out->buf) == 0, ESP_FAIL, TAG, "DQBUF bitstream failed");
+
+    int64_t t0 = esp_timer_get_time();
+    if (ioctl(enc->fd, VIDIOC_DQBUF, &out->buf) != 0) {
+        ESP_LOGE(TAG, "no bitstream after %d ms", (int)((esp_timer_get_time() - t0) / 1000));
+        /* The input slot is still queued. Leaving it there makes this permanent:
+         * REQBUFS gave us one input slot, so the next QBUF of index 0 is rejected
+         * and no frame is ever encoded again. */
+        if (ioctl(enc->fd, VIDIOC_DQBUF, &in_buf) != 0) {
+            ESP_LOGE(TAG, "input slot stuck too; the encoder needs a restart");
+        }
+        return ESP_FAIL;
+    }
 
     out->data = enc->out_mmap[out->buf.index];
     out->bytesused = out->buf.bytesused;
 
     /* Reclaim the input slot now that the encoder is done reading the frame. */
-    ESP_RETURN_ON_FALSE(ioctl(enc->fd, VIDIOC_DQBUF, &in_buf) == 0, ESP_FAIL, TAG, "DQBUF input failed");
+    if (ioctl(enc->fd, VIDIOC_DQBUF, &in_buf) != 0) {
+        ESP_LOGE(TAG, "DQBUF input failed");
+        hal_h264_release(enc, out);  /* or the bitstream pool shrinks by one */
+        return ESP_FAIL;
+    }
+
+    /* The driver flags a frame it could not produce -- an output buffer overflow
+     * reaches us this way rather than as an ioctl error. Sending it on would push
+     * an empty NAL to the peer. */
+    if ((out->buf.flags & V4L2_BUF_FLAG_ERROR) || out->bytesused == 0) {
+        ESP_LOGE(TAG, "encoder reported a bad frame (flags=0x%" PRIx32 ", %u bytes)",
+                 (uint32_t)out->buf.flags, (unsigned)out->bytesused);
+        hal_h264_release(enc, out);
+        return ESP_FAIL;
+    }
+
     return ESP_OK;
 }
 

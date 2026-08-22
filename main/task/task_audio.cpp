@@ -78,6 +78,6 @@ void task_audio(void *arg) {
 
         /* Bounded wait, unlike video's best-effort drop: this task must come
          * back round within 20 ms or the I2S RX ring overruns. */
-        webrtc_send_audio(g711a, frames, WEBRTC_AUDIO_LOCK_MS);
+        webrtc_send_audio(g711a, frames);
     }
 }

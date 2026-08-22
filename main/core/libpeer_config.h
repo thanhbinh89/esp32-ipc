@@ -50,14 +50,40 @@
  * translation unit. CONFIG_VIDEO_BUFFER_SIZE is not passed that way and needs none.
  */
 
-/* 1 frame per ~83 ms; must fit one IDR whole. */
-#define CONFIG_VIDEO_BUFFER_SIZE (150 * 1024)
+/* Bitrate 1Mbps - 1 frame per ~83 ms; must fit one or two IDR frame. */
+#define CONFIG_VIDEO_BUFFER_SIZE (2 * 150 * 1024)
 
-/* 164 B per 20 ms -> 5 entries is ~100 ms of slack against a stalled peer task. */
+/*
+ * 164 B per 20 ms, plus a 4-byte length prefix rounded up by ALIGN32, so an entry
+ * costs 168 B and this holds ~500 ms.
+ *
+ * It was 5 entries, which is 4 after the prefix -- 80 ms. That is less than one
+ * pass of peer_connection_loop() whenever a video burst is in flight, and audio
+ * overflowed for 82% of a measured session. The loop now drains audio before
+ * video, which bounds the gap to a single pass rather than a pass plus a whole
+ * video ring, but the ring still has to cover that pass; sizing it in hundreds of
+ * milliseconds rather than tens is what makes it stop mattering.
+ *
+ * This is worst-case latency, not added latency: the ring drains every pass and
+ * only fills when the peer task is behind. It lives in PSRAM (buffer_new uses
+ * heap_caps_calloc), so it does not compete for the internal heap.
+ */
 #undef CONFIG_AUDIO_BUFFER_SIZE
-#define CONFIG_AUDIO_BUFFER_SIZE (164 * 5)
+#define CONFIG_AUDIO_BUFFER_SIZE (168 * 25)
 
 /* Outbound datachannel only, and the app never sends on it. Receiving is
  * unaffected: on_dc_message() does not go through this ring. */
 #undef CONFIG_DATA_BUFFER_SIZE
 #define CONFIG_DATA_BUFFER_SIZE (1024)
+
+/*
+ * How long the signaling task may sit in select() waiting for MQTT data.
+ *
+ * libpeer used CONFIG_TLS_READ_TIMEOUT (3000) here, but that same constant is a
+ * retry *count* in peer_connection_dtls_srtp_recv(), so it cannot be lowered
+ * without shortening the DTLS handshake budget -- patches/sepfy__libpeer.patch
+ * splits the two. This one only bounds how long an outgoing offer waits for the
+ * signaling task to come back round, so keep it short enough that a browser does
+ * not give up and long enough that the task is not spinning.
+ */
+#define CONFIG_MQTT_READ_TIMEOUT 200

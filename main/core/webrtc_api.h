@@ -11,10 +11,9 @@ extern "C" {
 /*
  * The only way for media producers to reach the PeerConnection.
  *
- * The connection handle, its ICE state and the mutex serialising it against
- * peer_connection_loop() are private to task_webrtc.cpp. Senders used to reach
- * them directly, which meant every call site had to remember to re-check the
- * state and take the lock, and the two that existed disagreed on the timeout.
+ * The connection handle and its ICE state are private to task_webrtc.cpp.
+ * Senders used to reach them directly, which meant every call site had to
+ * remember to re-check the state for itself.
  */
 
 /* True when the peer connection is up and media will actually go somewhere. */
@@ -22,12 +21,12 @@ bool webrtc_is_streaming(void);
 
 /*
  * Hand one encoded frame to libpeer. Returns the number of bytes accepted,
- * 0 when there is no peer to send to, or negative on failure — including
- * failure to take the lock within timeout_ms, which callers on a deadline
- * should treat as "drop this frame" rather than blocking.
+ * 0 when there is no peer to send to, or negative when the stream's ring buffer
+ * has no room for it. Never blocks: the frame is queued here and transmitted by
+ * the peer task.
  */
-int webrtc_send_video(const uint8_t *buf, size_t len, uint32_t timeout_ms);
-int webrtc_send_audio(const uint8_t *buf, size_t len, uint32_t timeout_ms);
+int webrtc_send_video(const uint8_t *buf, size_t len);
+int webrtc_send_audio(const uint8_t *buf, size_t len);
 
 /* Read-and-clear the browser's RTCP PLI request for a keyframe. */
 bool webrtc_take_keyframe_request(void);

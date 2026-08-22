@@ -92,9 +92,14 @@ static void detect_task(void *arg) {
             acc_n = 0;
         }
 
-        /* No delay here: the loop already blocks in frame_pool_recv(), which
-         * yields whenever the camera task has no frame ready. */
         frame_pool_release(s_feed, elem->index);
+
+        /* Yield one tick even though frame_pool_recv() above can block. It only
+         * blocks while the camera is ahead of us; once inference is slower than
+         * the feed interval a buffer is always waiting, this task never leaves
+         * the CPU, and IDLE1 stops feeding the task watchdog. At 1 ms a tick
+         * against a ~100 ms inference the cost is noise. */
+        vTaskDelay(1);
     }
 }
 

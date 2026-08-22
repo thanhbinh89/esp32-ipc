@@ -46,19 +46,26 @@ menu "IPC Internet"
                     The GPIO pin number used for the Ethernet MDIO line.
         endif
 
-        if APP_NETIF_WIFI
-            config ESP_WIFI_SSID
-                string "WiFi SSID"
-                default "myssid"
-                help
-                    SSID (network name) for the app to connect to.
+        # Deliberately NOT inside "if APP_NETIF_WIFI". Kconfig does not write
+        # invisible symbols to sdkconfig, so gating these on the netif choice made
+        # them vanish the moment Ethernet was selected -- and switching back gave
+        # the defaults below rather than the credentials that were there before.
+        # Keeping them always visible is what lets the two builds live side by
+        # side. hal_netif.c only reads them under #if CONFIG_APP_NETIF_WIFI, so on
+        # an Ethernet build they are two unused strings and nothing more.
+        config ESP_WIFI_SSID
+            string "WiFi SSID"
+            default "myssid"
+            help
+                SSID (network name) for the app to connect to.
+                Ignored unless the network interface above is Wi-Fi.
 
-            config ESP_WIFI_PASSWORD
-                string "WiFi Password"
-                default "mypassword"
-                help
-                    WiFi password (WPA or WPA2) for the app to use.
-        endif
+        config ESP_WIFI_PASSWORD
+            string "WiFi Password"
+            default "mypassword"
+            help
+                WiFi password (WPA or WPA2) for the app to use.
+                Ignored unless the network interface above is Wi-Fi.
 
 endmenu
 

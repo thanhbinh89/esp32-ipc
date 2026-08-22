@@ -19,6 +19,7 @@ extern "C" {
 typedef struct {
     int fd;
     uint8_t *out_mmap[ENC_OUT_BUF_COUNT];
+    size_t out_length;   /*!< bytes the driver mapped per bitstream buffer */
     bool no_force_idr;  /*!< latched once the driver rejects FORCE_KEY_FRAME */
 } hal_h264_t;
 
