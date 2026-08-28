@@ -244,15 +244,36 @@ menu "IPC Audio"
             The multiple of the sample rate used to generate the audio master clock (MCLK).
 
     config APP_AUDIO_VOLUME
-        int "Audio Volume"
+        int "Speaker volume (0-100)"
+        range 0 100
         default 70
         help
-            The volume level (0-100) for audio output.
+            Output level of the ES8311 DAC, applied once at init. Drives both
+            halves of what comes out of the speaker: the WebRTC downlink from the
+            browser, and the power-on tone below.
 
     config APP_AUDIO_MIC_GAIN_DB
-        string "Audio Microphone Gain (dB)"
+        string "Microphone gain (dB)"
         default "30.0"
         help
-            The gain (in dB) applied to the audio input from the microphone.
-            
+            Gain applied to the ES8311 ADC ahead of the WebRTC uplink. A string
+            rather than an int because the codec takes a float; hal_audio.c
+            parses it with strtof().
+
+            Raise it if the far end hears the room too faintly, but note that it
+            amplifies the speaker's own output back into the microphone as well
+            -- there is no echo canceller in this path, so a device with the
+            speaker and microphone close together will howl before it gets loud.
+
+    config APP_AUDIO_WELCOME_TONE
+        bool "Play a tone at power-on"
+        default y
+        help
+            Plays a short rising arpeggio once the audio codec is up, which on
+            this board is after the network has an IP -- so hearing it means the
+            camera has finished booting and is reachable, not merely powered.
+
+            Synthesised at runtime from three sine tones, so it costs no flash
+            and no PSRAM. Turn it off for a silent install.
+
 endmenu

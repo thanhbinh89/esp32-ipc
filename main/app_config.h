@@ -6,6 +6,7 @@
  * task headers.
  */
 
+#include "sdkconfig.h"
 #include "libpeer_config.h"
 
 #ifdef __cplusplus
@@ -234,6 +235,38 @@ extern "C" {
 #define AUDIO_SAMPLES_PER_PACKET (CONFIG_AUDIO_DURATION * AUDIO_SAMPLE_RATE / 1000)
 #define AUDIO_READ_BYTES    (AUDIO_SAMPLES_PER_PACKET * 2)
 
+/* G.711 is defined at 8 kHz, and libpeer stamps PCMA timestamps at 8 kHz
+ * unconditionally (rtp.c: CONFIG_AUDIO_DURATION * 8000 / 1000 per packet).
+ * CONFIG_APP_AUDIO_SAMPLE_RATE can still be pointed elsewhere, which would
+ * transpose the audio in both directions and skew every RTP timestamp with
+ * nothing in the log to say so. */
+#if CONFIG_APP_AUDIO_SAMPLE_RATE != AUDIO_SAMPLE_RATE
+#error "CONFIG_APP_AUDIO_SAMPLE_RATE must be 8000: G.711/PCMA is an 8 kHz codec"
+#endif
+
+/*
+ * Downlink jitter buffer, in milliseconds of A-law -- one byte per sample, so
+ * the byte size is just this times 8.
+ *
+ * This is the whole latency budget the far end's talk-back gets: the peer task
+ * fills it at whatever rate the network delivers and task_speaker drains it at
+ * exactly 8 kHz, so however full it sits is how far behind real time the voice
+ * comes out. Too small and normal network jitter clips words; too large and a
+ * burst parks half a second of backlog that never drains, because nothing here
+ * resamples. 160 ms is eight of Chrome's 20 ms PCMA packets.
+ *
+ * Overflow is reported once a second by task_speaker rather than being silent.
+ */
+#define AUDIO_SPK_JITTER_MS    160
+#define AUDIO_SPK_JITTER_BYTES (AUDIO_SPK_JITTER_MS * AUDIO_SAMPLE_RATE / 1000)
+
+/* Power-on chime. Amplitude is a third of full scale: the tone is a pure sine,
+ * which at full scale is far louder than the speech that follows it at the same
+ * CONFIG_APP_AUDIO_VOLUME. The fade is applied to both ends of every note so the
+ * PA never sees a step edge. */
+#define AUDIO_TONE_AMPLITUDE   11000
+#define AUDIO_TONE_FADE_MS     10
+
 /* --------------------------------------------------------------- webrtc ---- */
 
 /*
@@ -267,6 +300,7 @@ extern "C" {
 /* ------------------------------------------------------------ scheduling ---- */
 
 #define TASK_AUDIO_STACK_SIZE   4096
+#define TASK_SPEAKER_STACK_SIZE 3072
 #define TASK_VIDEO_STACK_SIZE   4096
 #define TASK_WEBRTC_STACK_SIZE  4096
 #define TASK_CAPTURE_STACK_SIZE 4096
@@ -295,6 +329,7 @@ extern "C" {
  * no buffer is free -- so what it loses is detections, never frames.
  */
 #define TASK_PRIO_AUDIO         5
+#define TASK_PRIO_SPEAKER       5   /* same class as the mic: one I2S deadline each */
 #define TASK_PRIO_PEER          6   /* peer loop */
 #define TASK_PRIO_VIDEO_CAP     5
 #define TASK_PRIO_VIDEO_ENC     5
@@ -328,6 +363,7 @@ extern "C" {
  */
 #define TASK_CORE_VIDEO         0   /* capture, OSD, encode */
 #define TASK_CORE_AUDIO         0
+#define TASK_CORE_SPEAKER       0
 #define TASK_CORE_WEBRTC        0   /* signaling only: prio 3, polls MQTT at 10 ms */
 #define TASK_CORE_PEER          0   /* peer loop */
 #define TASK_CORE_DETECT        1

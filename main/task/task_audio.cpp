@@ -8,40 +8,11 @@
 #include "esp_codec_dev.h"
 
 #include "app_config.h"
+#include "g711.h"
 #include "hal_audio.h"
 #include "webrtc_api.h"
 
 static const char *TAG = "audio";
-
-static uint8_t linear16_to_g711a(int16_t sample) {
-    const uint16_t seg_end[8] = {0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF};
-    uint8_t mask;
-    uint8_t aval;
-    uint16_t pcm;
-    int seg;
-
-    pcm = sample < 0 ? (uint16_t)(-sample - 1) : (uint16_t)sample;
-    mask = sample >= 0 ? 0xD5 : 0x55;
-    pcm >>= 3;
-
-    for (seg = 0; seg < 8; seg++) {
-        if (pcm <= seg_end[seg]) {
-            break;
-        }
-    }
-
-    if (seg >= 8) {
-        return 0x7F ^ mask;
-    }
-
-    aval = (uint8_t)(seg << 4);
-    if (seg < 2) {
-        aval |= (pcm >> 1) & 0x0F;
-    } else {
-        aval |= (pcm >> seg) & 0x0F;
-    }
-    return aval ^ mask;
-}
 
 void task_audio(void *arg) {
     ESP_LOGD(TAG, "task_audio started");
@@ -73,7 +44,7 @@ void task_audio(void *arg) {
 
         int frames = AUDIO_READ_BYTES / sizeof(int16_t);
         for (int i = 0; i < frames; i++) {
-            g711a[i] = linear16_to_g711a(pcm[i]);
+            g711a[i] = g711a_encode(pcm[i]);
         }
 
         /* Bounded wait, unlike video's best-effort drop: this task must come

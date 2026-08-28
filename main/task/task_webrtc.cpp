@@ -8,6 +8,7 @@
 #include "peer.h"
 
 #include "app_config.h"
+#include "task_speaker.h"
 #include "webrtc_api.h"
 
 static const char *TAG = "webrtc";
@@ -39,6 +40,19 @@ static void on_dc_open(void *user_data) {
 static void on_dc_close(void *user_data) {
     ESP_LOGI(TAG, "datachannel close");
     s_datachannel_open = false;
+}
+
+/*
+ * Downlink audio: one RTP payload the remote sent us, already decrypted and
+ * stripped of its RTP header by libpeer's rtp_decode_generic().
+ *
+ * Runs on the peer task, so it only queues -- decoding A-law and feeding the
+ * DAC happens in task_speaker. Drops are counted there; nothing is logged here,
+ * because at 50 packets a second a log on this path would cost more than the
+ * audio does.
+ */
+static void on_audio_track(uint8_t *data, size_t size, void *user_data) {
+    speaker_submit_g711a(data, size);
 }
 
 static void on_request_keyframe(void *user_data) {
@@ -118,6 +132,7 @@ void task_webrtc(void *arg) {
     cfg.video_codec = CODEC_H264;
     cfg.datachannel = DATA_CHANNEL_BINARY;
     cfg.on_request_keyframe = on_request_keyframe;
+    cfg.onaudiotrack = on_audio_track;
 
     peer_init();
     s_pc = peer_connection_create(&cfg);

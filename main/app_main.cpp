@@ -9,6 +9,7 @@
 #include "hal_netif.h"
 #include "hal_video_init.h"
 #include "task_audio.h"
+#include "task_speaker.h"
 #include "task_video.h"
 #include "webrtc_api.h"
 
@@ -45,6 +46,11 @@ extern "C" void app_main(void) {
 
     ESP_LOGI(TAG, "Initializing audio...");
     if (hal_audio_init() == ESP_OK) {
+        /* Uplink and downlink are separate tasks; see task_speaker.h for why.
+         * The speaker goes first because it owns the power-on tone, and because
+         * its jitter buffer has to exist before task_webrtc can accept a peer. */
+        xTaskCreatePinnedToCore(task_speaker, "speaker", TASK_SPEAKER_STACK_SIZE, NULL,
+                                TASK_PRIO_SPEAKER, NULL, TASK_CORE_SPEAKER);
         xTaskCreatePinnedToCore(task_audio, "audio", TASK_AUDIO_STACK_SIZE, NULL,
                                 TASK_PRIO_AUDIO, NULL, TASK_CORE_AUDIO);
     } else {
